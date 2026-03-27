@@ -5,7 +5,7 @@ import { LineStyles } from "./SHOWLINE.js";
 import { quaposLowQuality } from "../filters.js";
 import type { LayerConfig } from "../symbolology/index.js";
 
-const procs = { DEPARE03, DEPCNT03, RESTRN01 };
+const procs = { DEPARE03, DEPCNT03, RESTRN01, SOUNDG03 };
 
 export function CS(config: LayerConfig, ref: Reference) {
   if (ref.name in procs) {
@@ -157,7 +157,79 @@ export function SEABED01(config: LayerConfig): ExpressionSpecification {
 }
 
 /** SNDFRM04 - 13.2.15 Symbolizing soundings, including safety depth */
-/** SOUNDG03 - 13.2.16 Entry procedure for symbolizing soundings */
+
+/**
+ * SOUNDG03 - 13.2.16 Entry procedure for symbolizing soundings
+ *
+ * S-57 SOUNDG features are MultiPoint, but the tile pipeline splits them into
+ * individual points with a DEPTH attribute (SPLIT_MULTIPOINT=ON, ADD_SOUNDG_DEPTH=ON).
+ *
+ * The S-52 spec composites individual digit symbols (SOUNDG10, SOUNDG25, etc.) to render
+ * depth values. MapLibre can't composite multiple symbols per feature, so we render
+ * soundings as formatted text instead, matching the visual intent:
+ *   - Depths < 10: show one decimal (e.g. "3.5")
+ *   - Depths 10–30: show one decimal if non-zero (e.g. "15.2"), else integer ("15")
+ *   - Depths > 30: integer only ("45")
+ *   - Negative depths (drying heights): prefixed with minus
+ *   - Colour: SNDG2 (shallow/black) when depth <= safetyDepth, SNDG1 (deep/grey) otherwise
+ */
+export function SOUNDG03(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode, safetyDepth } = config;
+  const depth: ExpressionSpecification = ["get", "DEPTH"];
+  const absDepth: ExpressionSpecification = ["abs", depth];
+
+  // S-52 formatting rules for sounding values
+  const textField: ExpressionSpecification = [
+    "case",
+    // Depths < 10: always show one decimal
+    ["<", absDepth, 10],
+    [
+      "number-format",
+      depth,
+      { "min-fraction-digits": 1, "max-fraction-digits": 1 },
+    ],
+    // Depths 10–30: show one decimal if fractional part is non-zero
+    ["all", ["<=", absDepth, 30], ["!=", ["%", absDepth, 1], 0]],
+    [
+      "number-format",
+      depth,
+      { "min-fraction-digits": 1, "max-fraction-digits": 1 },
+    ],
+    // Otherwise: integer only
+    [
+      "number-format",
+      depth,
+      { "min-fraction-digits": 0, "max-fraction-digits": 0 },
+    ],
+  ];
+
+  // Colour by depth relative to safety depth
+  const textColor: ExpressionSpecification = [
+    "case",
+    ["<=", depth, safetyDepth],
+    colour(mode, "SNDG2"),
+    colour(mode, "SNDG1"),
+  ];
+
+  return [
+    {
+      type: "symbol",
+      filter: ["has", "DEPTH"],
+      layout: {
+        "text-field": textField,
+        "text-font": ["Metropolis Regular"],
+        "text-size": 11,
+        "text-allow-overlap": false,
+        "symbol-placement": "point",
+      },
+      paint: {
+        "text-color": textColor,
+        "text-halo-color": colour(mode, "NODTA"),
+        "text-halo-width": 1,
+      },
+    },
+  ];
+}
 /** SYMINS02 - 13.2.17 Symbolizing encoded objects specified by IMO */
 /** TOPMAR01 - 13.2.18 Topmarks */
 /** UDWHAZ05 - 13.2.19 Isolated dangers in general that endanger own ship */
