@@ -1,4 +1,4 @@
-import s52, { colours, Mode } from "@enc-tiles/s52";
+import s52, { colour, Mode } from "@enc-tiles/s52";
 import type {
   BackgroundLayerSpecification,
   ExpressionFilterSpecification,
@@ -78,7 +78,13 @@ export function lookupGroupToLayers(
   lookups: LookupEntry[],
   config: LayerConfig,
 ): LayerSpecification[] {
-  const [fallbackLookup, ...otherLookups] = lookups;
+  // Per S-52 10.3.3.1, the fallback entry is the one with no attribute conditions.
+  const fallbackIndex = lookups.findIndex((l) => l.attc.length === 0);
+  const fallbackLookup =
+    fallbackIndex >= 0 ? lookups[fallbackIndex] : lookups[0];
+  const otherLookups = lookups.filter(
+    (_, i) => i !== (fallbackIndex >= 0 ? fallbackIndex : 0),
+  );
 
   const fallbackFilter: FilterSpecification = [
     "!",
@@ -105,13 +111,20 @@ export function lookupGroupToLayers(
   ];
 }
 
-let i = 0;
+function lookupId(lookup: LookupEntry): string {
+  const parts = [lookup.obcl, lookup.ftyp];
+  if (lookup.attc.length > 0) {
+    parts.push(lookup.attc.map((c) => `${c.attl}${c.attv ?? ""}`).join("_"));
+  }
+  return parts.join("-");
+}
 
 export function lookupToLayers(
   lookup: LookupEntry,
   config: LayerConfig,
 ): LayerSpecification[] {
-  return instructionsToStyles(lookup.inst, config).map((layer) => {
+  const baseId = lookupId(lookup);
+  return instructionsToStyles(lookup.inst, config).map((layer, index) => {
     return {
       ...layer,
       metadata: {
@@ -131,7 +144,7 @@ export function lookupToLayers(
       },
       source: "enc",
       "source-layer": lookup.obcl,
-      id: [i++, lookup.obcl, lookup.ftyp].join("-"),
+      id: `${baseId}-${index}`,
     };
   });
 }
@@ -141,7 +154,7 @@ function background({ mode }: LayerConfig): BackgroundLayerSpecification {
     id: "background",
     type: "background",
     paint: {
-      "background-color": colours[mode].NODTA,
+      "background-color": colour(mode, "NODTA"),
     },
   };
 }

@@ -1,6 +1,7 @@
 import { LineLayerSpecification } from "maplibre-gl";
-import { colours } from "@enc-tiles/s52";
+import { colour, ColourName } from "@enc-tiles/s52";
 import { Reference } from "./parser.js";
+import type { LayerConfig } from "../symbolology/index.js";
 
 export const LineStyles = {
   SOLD: [], // (_________)
@@ -26,16 +27,17 @@ export const LineStyles = {
  * COLOUR Line colour parameter. A valid colour token as described in section 7
  */
 export function LS(
+  config: LayerConfig,
   style: Reference,
   width: number,
-  colour: Reference,
+  colourRef: Reference,
 ): Pick<LineLayerSpecification, "type" | "paint"> {
   return {
     type: "line",
     paint: {
       "line-dasharray": LineStyles[style.name] ?? [],
       "line-width": width,
-      "line-color": colours.DAY[colour.name],
+      "line-color": colour(config.mode, colourRef.name as ColourName),
     },
   };
 }
@@ -51,6 +53,7 @@ export function LS(
  * complex linestyle named by the LINNAM parameter.
  */
 export function LC(
+  _config: LayerConfig,
   linnam: Reference,
 ): Pick<LineLayerSpecification, "type" | "paint"> {
   return {

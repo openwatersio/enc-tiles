@@ -144,3 +144,17 @@ export function listExcludes(
 ): ExpressionFilterSpecification {
   return ["!", listIncludes(attr, ...values)];
 }
+
+/**
+ * Filter for low quality position (QUAPOS).
+ *
+ * QUAPOS values 1 (surveyed), 10 (precise), 11 (calculated) indicate good quality.
+ * Any other QUAPOS value indicates low quality. Features without QUAPOS are assumed accurate.
+ */
+export function quaposLowQuality(): ExpressionFilterSpecification {
+  return [
+    "all",
+    ["has", "QUAPOS"],
+    ["!", ["in", ["to-number", ["get", "QUAPOS"]], ["literal", [1, 10, 11]]]],
+  ];
+}

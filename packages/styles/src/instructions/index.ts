@@ -1,4 +1,4 @@
-import { parse, Reference } from "./parser.js";
+import { parse } from "./parser.js";
 import { CS } from "./CALLSYMPROC.js";
 import { AC, AP } from "./SHOWAREA.js";
 import { LC, LS } from "./SHOWLINE.js";
@@ -14,7 +14,7 @@ export * from "./SHOWLINE.js";
 export * from "./SHOWPOINT.js";
 export * from "./SHOWTEXT.js";
 
-const commands = { AC, AP, LC, LS, SY, TE, TX };
+const commands = { AC, AP, CS, LC, LS, SY, TE, TX };
 
 export function instructionsToStyles(
   instruction: string | undefined,
@@ -24,17 +24,13 @@ export function instructionsToStyles(
 
   return parse(instruction)
     .flatMap((instruction) => {
-      if (instruction.command === "CS") {
-        return CS(instruction.params[0] as Reference, config);
-      }
-
       const command = commands[instruction.command];
 
       if (!command) {
         throw new Error(`Unknown command: ${instruction.command}`);
       }
 
-      return command(...instruction.params);
+      return command(config, ...instruction.params);
     })
     .filter(Boolean);
 }

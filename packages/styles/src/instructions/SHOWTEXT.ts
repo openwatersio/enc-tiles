@@ -1,7 +1,8 @@
 import { ExpressionSpecification, SymbolLayerSpecification } from "maplibre-gl";
-import { colours } from "@enc-tiles/s52";
+import { colour, ColourName } from "@enc-tiles/s52";
 import sprintf from "./sprintf.js";
 import { Reference } from "./parser.js";
+import type { LayerConfig } from "../symbolology/index.js";
 
 export type TextLayerSpecification = Pick<
   SymbolLayerSpecification,
@@ -89,6 +90,7 @@ export enum SPACE {
  */
 
 export function showText(
+  config: LayerConfig,
   text: string | Reference | ExpressionSpecification,
   hjust: HJUST = HJUST.LEFT,
   vjust: VJUST = VJUST.BOTTOM,
@@ -96,7 +98,7 @@ export function showText(
   chars: string = "15110",
   xoffs: number = 0,
   yoffs: number = 0,
-  colour?: Reference,
+  colourRef?: Reference,
   display?: string,
 ): TextLayerSpecification {
   // TODO: make configurable
@@ -145,10 +147,12 @@ export function showText(
       ...(space === SPACE.WRAP ? { "text-max-width": 8 } : {}),
     },
     paint: {
-      // FIXME: make theme configurable
-      "text-color": colours.DAY[colour?.name ?? "CHBLK"],
-      "text-halo-color": "rgba(255, 255, 255, 0.5)",
-      "text-halo-width": 2,
+      "text-color": colour(
+        config.mode,
+        (colourRef?.name as ColourName) ?? "CHBLK",
+      ),
+      "text-halo-color": colour(config.mode, "NODTA"),
+      "text-halo-width": 1,
     },
   };
 }
@@ -175,19 +179,21 @@ function textAnchor(hjust: HJUST, vjust: VJUST): TextAnchor {
 }
 
 export function TX(
+  config: LayerConfig,
   string: string | Reference,
   ...args: any[]
 ): TextLayerSpecification {
-  return showText(string, ...args);
+  return showText(config, string, ...args);
 }
 
 export function TE(
+  config: LayerConfig,
   format: string,
   attribute: string,
   ...args: any[]
 ): TextLayerSpecification {
   const textField = formatAttribute(format, attribute);
-  return showText(textField, ...args);
+  return showText(config, textField, ...args);
 }
 
 export function formatAttribute(

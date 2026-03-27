@@ -1,12 +1,13 @@
 import { ExpressionSpecification, LayerSpecification } from "maplibre-gl";
 import { Reference } from "./parser.js";
-import { colours } from "@enc-tiles/s52";
+import { colour } from "@enc-tiles/s52";
 import { LineStyles } from "./SHOWLINE.js";
+import { quaposLowQuality } from "../filters.js";
 import type { LayerConfig } from "../symbolology/index.js";
 
 const procs = { DEPARE03, DEPCNT03, RESTRN01 };
 
-export function CS(ref: Reference, config: LayerConfig) {
+export function CS(config: LayerConfig, ref: Reference) {
   if (ref.name in procs) {
     return procs[ref.name](config);
   } else {
@@ -39,38 +40,33 @@ export function DEPARE03(config: LayerConfig): Partial<LayerSpecification>[] {
 }
 
 /** DEPCNT03 - 13.2.2 Depth contours, including safety contour */
-export function DEPCNT03(_config: LayerConfig): Partial<LayerSpecification>[] {
+export function DEPCNT03(config: LayerConfig): Partial<LayerSpecification>[] {
   // MapLibre doesn't support data expressions in `line-dasharray`, so split into two layers with filters.
-  // QUAPOS values 1 (surveyed), 10 (precise), 11 (calculated) indicate good quality → solid lines.
-  // Any other QUAPOS value indicates low quality → dashed lines.
-  const lowQualityExpression: ExpressionSpecification = [
-    "all",
-    ["has", "QUAPOS"],
-    ["!", ["in", ["get", "QUAPOS"], ["literal", [1, 10, 11]]]],
-  ];
+  const lowQuality = quaposLowQuality();
+  const depcn = colour(config.mode, "DEPCN");
   return [
     {
       type: "line",
-      filter: lowQualityExpression,
+      filter: lowQuality,
       paint: {
         "line-dasharray": LineStyles.DASH,
         "line-width": 1,
-        "line-color": colours.DAY.DEPCN,
+        "line-color": depcn,
       },
     },
     {
       type: "line",
-      filter: ["!", lowQualityExpression],
+      filter: ["!", lowQuality],
       paint: {
         "line-width": 1,
-        "line-color": colours.DAY.DEPCN,
+        "line-color": depcn,
       },
     },
     {
       type: "symbol",
     },
     // TODO: add user pref to display contour labels
-    ...SAFECON01(),
+    ...SAFECON01(config),
   ];
 }
 
@@ -95,7 +91,7 @@ export function RESTRN01(_config: LayerConfig): Partial<LayerSpecification>[] {
 /** TODO: RESCSP02 - 13.2.11 Restrictions – attribute RESTRN */
 
 /** SAFCON01 - 13.2.12 Contour labels, including safety contour */
-export function SAFECON01(): Partial<LayerSpecification>[] {
+export function SAFECON01(config: LayerConfig): Partial<LayerSpecification>[] {
   return [
     {
       type: "symbol",
@@ -121,9 +117,9 @@ export function SAFECON01(): Partial<LayerSpecification>[] {
         "text-font": ["Metropolis Regular"],
       },
       paint: {
-        "text-halo-color": "rgba(255, 255, 255, 0.5)",
+        "text-halo-color": colour(config.mode, "NODTA"),
         "text-halo-width": 1,
-        "text-color": colours.DAY.CHBLK,
+        "text-color": colour(config.mode, "CHBLK"),
       },
     },
   ];
@@ -133,8 +129,7 @@ export function SAFECON01(): Partial<LayerSpecification>[] {
 
 /** SEABED01 - 13.2.14 Colour fill for depth areas */
 export function SEABED01(config: LayerConfig): ExpressionSpecification {
-  const theme = colours[config.mode];
-  const { shallowDepth, safetyDepth, deepDepth } = config;
+  const { mode, shallowDepth, safetyDepth, deepDepth } = config;
   return [
     "case",
     [
@@ -142,22 +137,22 @@ export function SEABED01(config: LayerConfig): ExpressionSpecification {
       [">=", ["var", "drval1"], deepDepth],
       [">", ["var", "drval2"], deepDepth],
     ],
-    theme.DEPDW,
+    colour(mode, "DEPDW"),
     [
       "all",
       [">=", ["var", "drval1"], safetyDepth],
       [">", ["var", "drval2"], safetyDepth],
     ],
-    theme.DEPMD,
+    colour(mode, "DEPMD"),
     [
       "all",
       [">=", ["var", "drval1"], shallowDepth],
       [">", ["var", "drval2"], shallowDepth],
     ],
-    theme.DEPMS,
+    colour(mode, "DEPMS"),
     ["all", [">=", ["var", "drval1"], 0], [">", ["var", "drval2"], 0]],
-    theme.DEPVS,
-    theme.DEPIT,
+    colour(mode, "DEPVS"),
+    colour(mode, "DEPIT"),
   ];
 }
 

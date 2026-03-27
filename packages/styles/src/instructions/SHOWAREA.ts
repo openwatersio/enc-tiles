@@ -1,6 +1,7 @@
 import { FillLayerSpecification } from "maplibre-gl";
-import { colours } from "@enc-tiles/s52";
+import { colour, ColourName } from "@enc-tiles/s52";
 import { Reference } from "./parser.js";
+import type { LayerConfig } from "../symbolology/index.js";
 
 /**
  * AP – Showarea (area fill)
@@ -18,6 +19,7 @@ import { Reference } from "./parser.js";
  * PATTERN: the name of the pattern
  */
 export function AP(
+  _config: LayerConfig,
   pattern: Reference,
 ): Pick<FillLayerSpecification, "type" | "paint"> {
   return {
@@ -52,14 +54,15 @@ export const TRANSP = {
  * 3(75)% where 3 out of every 4 pixels use TRNSP
  */
 export function AC(
-  colour: Reference,
+  config: LayerConfig,
+  colourRef: Reference,
   transp: number = 0,
 ): Pick<FillLayerSpecification, "type" | "paint"> {
   const opacity = TRANSP[transp] ?? 1.0;
   return {
     type: "fill",
     paint: {
-      "fill-color": colours.DAY[colour.name],
+      "fill-color": colour(config.mode, colourRef.name as ColourName),
       "fill-opacity": opacity,
     },
   };
