@@ -14,8 +14,10 @@ const procs = {
   DEPCNT03,
   LIGHTS06,
   OBSTRN07,
+  QUAPOS01,
   RESARE04,
   RESTRN01,
+  SLCONS04,
   SOUNDG03,
   TOPMAR01,
   WRECKS05,
@@ -808,9 +810,91 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
     },
   ];
 }
-/** TODO: QUAPOS01 - 13.2.6 Quality(accuracy) of position */
-/** TODO: QUALIN01 - 13.2.7 Quality of position of line objects */
-/** TODO: QUAPNT02 - 13.2.8 Quality of position of point and area objects */
+/**
+ * QUAPOS01 - 13.2.7 Quality of position (S-52 PresLib 4.0, section 13.2.7)
+ *
+ * Applies to COALNE (line) and LNDARE (line, point).
+ * Dispatches to QUALIN01 for lines, QUAPNT02 for points.
+ */
+export function QUAPOS01(config: LayerConfig): Partial<LayerSpecification>[] {
+  return [
+    // Line objects → QUALIN01
+    ...QUALIN01(config),
+    // Point objects → QUAPNT02 (show LOWACC01 if low accuracy)
+    ...QUAPNT02(config),
+  ];
+}
+
+/**
+ * QUALIN01 - 13.2.8 Quality of line positions (S-52 PresLib 4.0, section 13.2.8)
+ *
+ * Sub-procedure called by QUAPOS01. For line objects, if QUAPOS indicates
+ * low accuracy (not 1, 10, or 11), symbolize with LC(LOWACC21).
+ * Otherwise use default line style from the lookup table.
+ *
+ * For COALNE: default is LS(SOLD,1,CSTLN).
+ * For LNDARE: default is LS(SOLD,1,CSTLN).
+ */
+export function QUALIN01(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode } = config;
+  const lowQuality = quaposLowQuality();
+
+  return [
+    // Low accuracy line segments → LOWACC21 pattern
+    {
+      type: "line",
+      filter: ["all", ["==", ["geometry-type"], "LineString"], lowQuality],
+      layout: {
+        // TODO: LC(LOWACC21) complex line pattern — using dashed approximation
+      },
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 1,
+        "line-color": colour(mode, "CHMGF"),
+      },
+    },
+    // Accurate line segments → solid CSTLN
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "LineString"],
+        ["!", lowQuality],
+      ],
+      paint: {
+        "line-width": 1,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+  ];
+}
+
+/**
+ * QUAPNT02 - 13.2.9 Quality of point/area positions (S-52 PresLib 4.0, section 13.2.9)
+ *
+ * Sub-procedure called by QUAPOS01, SLCONS04, OBSTRN07, WRECKS05.
+ * Shows LOWACC01 symbol at point/area features with low positional accuracy.
+ */
+export function QUAPNT02(_config: LayerConfig): Partial<LayerSpecification>[] {
+  return [
+    {
+      type: "symbol",
+      filter: [
+        "all",
+        [
+          "any",
+          ["==", ["geometry-type"], "Point"],
+          ["==", ["geometry-type"], "Polygon"],
+        ],
+        quaposLowQuality(),
+      ] as ExpressionFilterSpecification,
+      layout: {
+        "icon-image": "LOWACC01",
+        "icon-allow-overlap": true,
+      },
+    },
+  ];
+}
 // RESTRN value groups used by RESARE04, RESTRN01, and RESCSP02
 const RESTRN_ENTRY = ["7", "8", "14"];
 const RESTRN_ANCHOR = ["1", "2"];
@@ -1179,7 +1263,131 @@ export function SAFECON01(config: LayerConfig): Partial<LayerSpecification>[] {
   ];
 }
 
-/** SLCONS04 - 13.2.13 Shoreline constructions, including accuracy of position */
+/**
+ * SLCONS04 - 13.2.13 Shoreline constructions (S-52 PresLib 4.0, section 13.2.13)
+ *
+ * Applies to S-57 object class SLCONS (point, line, area).
+ * Attributes: QUAPOS, CONDTN, CATSLC, WATLEV
+ *
+ * Points: show LOWACC01 if low accuracy (via QUAPNT02).
+ * Lines/Areas: low accuracy segments → LC(LOWACC21),
+ *   otherwise line style by CONDTN/CATSLC/WATLEV lookup table.
+ */
+export function SLCONS04(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode } = config;
+  const lowQuality = quaposLowQuality();
+
+  return [
+    // Point: QUAPNT02 low accuracy symbol
+    ...QUAPNT02(config),
+
+    // Line/Area: low accuracy segments → dashed CHMGF (approximation of LC(LOWACC21))
+    {
+      type: "line",
+      filter: ["all", ["!=", ["geometry-type"], "Point"], lowQuality],
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 1,
+        "line-color": colour(mode, "CHMGF"),
+      },
+    },
+
+    // Line/Area: accurate segments — style by CONDTN/CATSLC/WATLEV
+    // CONDTN 1 or 2 (under construction, ruined) → dashed
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["!=", ["geometry-type"], "Point"],
+        ["!", lowQuality],
+        ["has", "CONDTN"],
+        ["in", ["get", "CONDTN"], ["literal", [1, 2]]],
+      ],
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 1,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+
+    // CATSLC 6, 15, or 16 (wharf, pier, promenade pier) → thick solid
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["!=", ["geometry-type"], "Point"],
+        ["!", lowQuality],
+        [
+          "any",
+          ["!", ["has", "CONDTN"]],
+          ["!", ["in", ["get", "CONDTN"], ["literal", [1, 2]]]],
+        ],
+        ["has", "CATSLC"],
+        ["in", ["get", "CATSLC"], ["literal", [6, 15, 16]]],
+      ],
+      paint: {
+        "line-width": 4,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+
+    // WATLEV 3 or 4 (always under water, covers/uncovers) → dashed
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["!=", ["geometry-type"], "Point"],
+        ["!", lowQuality],
+        [
+          "any",
+          ["!", ["has", "CONDTN"]],
+          ["!", ["in", ["get", "CONDTN"], ["literal", [1, 2]]]],
+        ],
+        [
+          "any",
+          ["!", ["has", "CATSLC"]],
+          ["!", ["in", ["get", "CATSLC"], ["literal", [6, 15, 16]]]],
+        ],
+        ["has", "WATLEV"],
+        ["in", ["get", "WATLEV"], ["literal", [3, 4]]],
+      ],
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+
+    // Default → solid CSTLN
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["!=", ["geometry-type"], "Point"],
+        ["!", lowQuality],
+        [
+          "any",
+          ["!", ["has", "CONDTN"]],
+          ["!", ["in", ["get", "CONDTN"], ["literal", [1, 2]]]],
+        ],
+        [
+          "any",
+          ["!", ["has", "CATSLC"]],
+          ["!", ["in", ["get", "CATSLC"], ["literal", [6, 15, 16]]]],
+        ],
+        [
+          "any",
+          ["!", ["has", "WATLEV"]],
+          ["!", ["in", ["get", "WATLEV"], ["literal", [3, 4]]]],
+        ],
+      ],
+      paint: {
+        "line-width": 2,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+  ];
+}
 
 /** SEABED01 - 13.2.14 Colour fill for depth areas */
 export function SEABED01(config: LayerConfig): ExpressionSpecification {
