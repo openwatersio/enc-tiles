@@ -9,7 +9,7 @@ import { LineStyles } from "./SHOWLINE.js";
 import { quaposLowQuality } from "../filters.js";
 import type { LayerConfig } from "../symbolology/index.js";
 
-const procs = { DEPARE03, DEPCNT03, RESTRN01, SOUNDG03 };
+const procs = { DEPARE03, DEPCNT03, RESTRN01, SOUNDG03, WRECKS05 };
 
 export function CS(config: LayerConfig, ref: Reference) {
   if (ref.name in procs) {
@@ -298,4 +298,212 @@ export function notIsolatedDanger(
   return ["!", isolatedDanger(config)];
 }
 
-/** WRECKS05 - 13.2.20 Wrecks */
+/**
+ * WRECKS05 - 13.2.21 Wrecks (S-52 PresLib 4.0, section 13.2.21)
+ *
+ * Applies to S-57 object class WRECKS (point and area).
+ * Attributes: VALSOU, CATWRK, WATLEV, EXPSOU
+ *
+ * Point wrecks:
+ *   - Isolated danger (VALSOU <= safetyContour, underwater) → ISODGR01
+ *   - VALSOU <= safetyDepth → DANGER01 (shallow hazard)
+ *   - VALSOU > safetyDepth → DANGER02 (deep hazard)
+ *   - No VALSOU → symbol based on CATWRK/WATLEV from lookup table
+ *
+ * Area wrecks:
+ *   - Fill: CHBRN (WATLEV 1,2), DEPIT (WATLEV 4), DEPVS (default/3/5)
+ *   - Line: dotted CHBLK if danger or shallow, dashed CHBLK if deep, else by WATLEV
+ */
+export function WRECKS05(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode, safetyDepth } = config;
+  const isDanger = isolatedDanger(config);
+  const notDanger = notIsolatedDanger(config);
+
+  return [
+    // --- Point wrecks ---
+
+    // Isolated danger: ISODGR01 (from UDWHAZ05)
+    {
+      type: "symbol",
+      filter: ["all", ["==", ["geometry-type"], "Point"], isDanger],
+      layout: {
+        "icon-image": "ISODGR01",
+        "icon-allow-overlap": true,
+      },
+    },
+
+    // Has sounding, shallow (not isolated danger) → DANGER01
+    {
+      type: "symbol",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Point"],
+        notDanger,
+        ["has", "VALSOU"],
+        ["<=", ["get", "VALSOU"], safetyDepth],
+      ],
+      layout: {
+        "icon-image": "DANGER01",
+        "icon-allow-overlap": true,
+      },
+    },
+
+    // Has sounding, deep (not isolated danger) → DANGER02
+    {
+      type: "symbol",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Point"],
+        notDanger,
+        ["has", "VALSOU"],
+        [">", ["get", "VALSOU"], safetyDepth],
+      ],
+      layout: {
+        "icon-image": "DANGER02",
+        "icon-allow-overlap": true,
+      },
+    },
+
+    // No sounding → symbol by CATWRK/WATLEV (S-52 Continuation A lookup table)
+    {
+      type: "symbol",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Point"],
+        ["!", ["has", "VALSOU"]],
+      ],
+      layout: {
+        "icon-image": [
+          "case",
+          // WATLEV 1 (partly submerged) or 2 (always dry) → visible wreck
+          ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
+          "WRECKS01",
+          // WATLEV 4 (covers/uncovers) → drying wreck
+          ["==", ["get", "WATLEV"], 4],
+          "WRECKS01",
+          // CATWRK 1 (non-dangerous) + WATLEV 3 (always underwater)
+          ["all", ["==", ["get", "CATWRK"], 1], ["==", ["get", "WATLEV"], 3]],
+          "WRECKS04",
+          // CATWRK 2 (dangerous) + WATLEV 3
+          ["all", ["==", ["get", "CATWRK"], 2], ["==", ["get", "WATLEV"], 3]],
+          "WRECKS05",
+          // CATWRK 4 or 5 (showing mast/funnel)
+          ["in", ["get", "CATWRK"], ["literal", [4, 5]]],
+          "WRECKS01",
+          // Default
+          "WRECKS05",
+        ] as ExpressionSpecification,
+        "icon-allow-overlap": true,
+      },
+    },
+
+    // --- Area wrecks ---
+
+    // Area fill based on WATLEV
+    {
+      type: "fill",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      paint: {
+        "fill-color": [
+          "case",
+          // WATLEV 1,2 → land/brown
+          ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
+          colour(mode, "CHBRN"),
+          // WATLEV 4 → intertidal
+          ["==", ["get", "WATLEV"], 4],
+          colour(mode, "DEPIT"),
+          // Default (3, 5, or missing) → very shallow
+          colour(mode, "DEPVS"),
+        ] as ExpressionSpecification,
+      },
+    },
+
+    // Area outline: dotted for dangers/shallow, dashed for deep, default by WATLEV
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Polygon"],
+        [
+          "any",
+          isDanger,
+          ["all", ["has", "VALSOU"], ["<=", ["get", "VALSOU"], safetyDepth]],
+        ],
+      ],
+      paint: {
+        "line-dasharray": LineStyles.DOTT,
+        "line-width": 2,
+        "line-color": colour(mode, "CHBLK"),
+      },
+    },
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Polygon"],
+        notDanger,
+        ["has", "VALSOU"],
+        [">", ["get", "VALSOU"], safetyDepth],
+      ],
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CHBLK"),
+      },
+    },
+    // No VALSOU, WATLEV 1,2 → solid line
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Polygon"],
+        ["!", ["has", "VALSOU"]],
+        ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
+      ],
+      paint: {
+        "line-width": 2,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+    // No VALSOU, WATLEV 4 → dashed line
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Polygon"],
+        ["!", ["has", "VALSOU"]],
+        ["==", ["get", "WATLEV"], 4],
+      ],
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+    // No VALSOU, other WATLEV → dotted line
+    {
+      type: "line",
+      filter: [
+        "all",
+        ["==", ["geometry-type"], "Polygon"],
+        ["!", ["has", "VALSOU"]],
+        ["!", ["in", ["get", "WATLEV"], ["literal", [1, 2, 4]]]],
+      ],
+      paint: {
+        "line-dasharray": LineStyles.DOTT,
+        "line-width": 2,
+        "line-color": colour(mode, "CSTLN"),
+      },
+    },
+
+    // Area wreck isolated danger symbol at center
+    {
+      type: "symbol",
+      filter: ["all", ["==", ["geometry-type"], "Polygon"], isDanger],
+      layout: {
+        "icon-image": "ISODGR01",
+        "icon-allow-overlap": true,
+      },
+    },
+  ];
+}
