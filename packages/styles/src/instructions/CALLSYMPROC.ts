@@ -6,10 +6,18 @@ import {
 import { Reference } from "./parser.js";
 import { colour } from "@enc-tiles/s52";
 import { LineStyles } from "./SHOWLINE.js";
-import { quaposLowQuality } from "../filters.js";
+import { listIncludes, quaposLowQuality } from "../filters.js";
 import type { LayerConfig } from "../symbolology/index.js";
 
-const procs = { DEPARE03, DEPCNT03, OBSTRN07, RESTRN01, SOUNDG03, WRECKS05 };
+const procs = {
+  DEPARE03,
+  DEPCNT03,
+  OBSTRN07,
+  RESARE04,
+  RESTRN01,
+  SOUNDG03,
+  WRECKS05,
+};
 
 export function CS(config: LayerConfig, ref: Reference) {
   if (ref.name in procs) {
@@ -467,18 +475,338 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
 /** TODO: QUAPOS01 - 13.2.6 Quality(accuracy) of position */
 /** TODO: QUALIN01 - 13.2.7 Quality of position of line objects */
 /** TODO: QUAPNT02 - 13.2.8 Quality of position of point and area objects */
-/** TODO: RESARE04 - 13.2.9 Restricted areas - object class RESARE  */
+// RESTRN value groups used by RESARE04, RESTRN01, and RESCSP02
+const RESTRN_ENTRY = ["7", "8", "14"];
+const RESTRN_ANCHOR = ["1", "2"];
+const RESTRN_FISHING = ["3", "4", "5", "6", "24"];
+const RESTRN_OWN_SHIP = ["13", "16", "17", "23", "25", "26", "27"];
+const RESTRN_OTHER = [
+  "9",
+  "10",
+  "11",
+  "12",
+  "15",
+  "18",
+  "19",
+  "20",
+  "21",
+  "22",
+];
 
-/** RESTRN01 - 13.2.10 Entry procedure for restrictions */
-export function RESTRN01(_config: LayerConfig): Partial<LayerSpecification>[] {
+// CATREA value groups (military/safety vs nature/ecological)
+const CATREA_MILITARY = [
+  "1",
+  "8",
+  "9",
+  "12",
+  "14",
+  "18",
+  "19",
+  "21",
+  "24",
+  "25",
+  "26",
+];
+const CATREA_NATURE = ["4", "5", "6", "7", "10", "20", "22", "23"];
+
+/**
+ * Select the restriction symbol based on RESTRN priority cascade.
+ * Each continuation checks if additional restriction types exist alongside
+ * the primary type, upgrading the symbol suffix (51 → 61 → 71).
+ *
+ * Suffix meanings:
+ *   51 = only this restriction type
+ *   61 = this type + other navigational restrictions
+ *   71 = this type + environmental/nature restrictions
+ */
+function restrictionSymbol(
+  prefix: string,
+  additionalRestrn: string[],
+  config: LayerConfig,
+): Partial<LayerSpecification>[] {
+  const { mode } = config;
+
   return [
-    // {
-    //   filter: ['has', 'RESTRN'],
-    // }
+    // Symbol in center of area
+    {
+      type: "symbol",
+      layout: {
+        "icon-image": [
+          "case",
+          // Has additional navigational restrictions → 61
+          listIncludes("RESTRN", ...additionalRestrn),
+          `${prefix}61`,
+          // Has CATREA military/safety values → 61
+          [
+            "all",
+            ["has", "CATREA"],
+            listIncludes("CATREA", ...CATREA_MILITARY),
+          ],
+          `${prefix}61`,
+          // Has other RESTRN values (9-22) → 71
+          listIncludes("RESTRN", ...RESTRN_OTHER),
+          `${prefix}71`,
+          // Has CATREA nature values → 71
+          ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_NATURE)],
+          `${prefix}71`,
+          // Default → 51
+          `${prefix}51`,
+        ] as ExpressionSpecification,
+        "icon-allow-overlap": true,
+      },
+    },
+
+    // Boundary: plain boundaries use LS(DASH,2,CHMGD)
+    // TODO: symbolized boundaries should use LC pattern (e.g., LC(ENTRES51))
+    {
+      type: "line",
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CHMGD"),
+      },
+    },
   ];
 }
 
-/** TODO: RESCSP02 - 13.2.11 Restrictions – attribute RESTRN */
+/**
+ * RESARE04 - 13.2.9 Restricted areas (S-52 PresLib 4.0, section 13.2.9)
+ *
+ * Applies to S-57 object class RESARE only.
+ * Attributes: RESTRN (list), CATREA (list)
+ *
+ * Priority cascade:
+ *   1. Entry restricted/prohibited (RESTRN 7, 8, 14) → ENTRES symbol
+ *   2. Anchoring restricted/prohibited (RESTRN 1, 2) → ACHRES symbol
+ *   3. Fishing restricted/prohibited (RESTRN 3, 4, 5, 6, 24) → FSHRES symbol
+ *   4. Own ship restrictions (RESTRN 13, 16, 17, 23, 25, 26, 27) → CTYARE symbol
+ *   5. Other restrictions (RESTRN 9-22) → INFARE51
+ *   6. No RESTRN → symbol by CATREA or RSRDEF51
+ */
+export function RESARE04(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode } = config;
+
+  // The spec uses a priority cascade: first matching group wins.
+  // Each group produces a symbol layer + boundary layer.
+  // We implement this as multiple layers with mutually exclusive filters.
+
+  const hasRestrn: ExpressionFilterSpecification = ["has", "RESTRN"];
+  const hasEntry = listIncludes("RESTRN", ...RESTRN_ENTRY);
+  const hasAnchor = listIncludes("RESTRN", ...RESTRN_ANCHOR);
+  const hasFishing = listIncludes("RESTRN", ...RESTRN_FISHING);
+  const hasOwnShip = listIncludes("RESTRN", ...RESTRN_OWN_SHIP);
+  const hasOther = listIncludes("RESTRN", ...RESTRN_OTHER);
+
+  // Remaining RESTRN values for each level's "additional" check
+  const entryAdditional = [
+    ...RESTRN_ANCHOR,
+    ...RESTRN_FISHING,
+    ...RESTRN_OWN_SHIP,
+  ];
+  const anchorAdditional = [...RESTRN_FISHING, ...RESTRN_OWN_SHIP];
+  const fishingAdditional = [...RESTRN_OWN_SHIP];
+
+  const filterA: ExpressionFilterSpecification = ["all", hasRestrn, hasEntry];
+  const filterB: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    hasAnchor,
+  ];
+  const filterC: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    ["!", hasAnchor],
+    hasFishing,
+  ];
+  const filterD: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    ["!", hasAnchor],
+    ["!", hasFishing],
+    hasOwnShip,
+  ];
+  const filterOther: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    ["!", hasAnchor],
+    ["!", hasFishing],
+    ["!", hasOwnShip],
+    hasOther,
+  ];
+  const filterNoRestrn: ExpressionFilterSpecification = ["!", hasRestrn];
+
+  return [
+    // --- Continuation A: Entry restricted/prohibited ---
+    ...restrictionSymbol("ENTRES", entryAdditional, config).map((l) => ({
+      ...l,
+      filter: filterA,
+    })),
+
+    // --- Continuation B: Anchoring restricted/prohibited ---
+    ...restrictionSymbol("ACHRES", anchorAdditional, config).map((l) => ({
+      ...l,
+      filter: filterB,
+    })),
+
+    // --- Continuation C: Fishing restricted/prohibited ---
+    ...restrictionSymbol("FSHRES", fishingAdditional, config).map((l) => ({
+      ...l,
+      filter: filterC,
+    })),
+
+    // --- Continuation D: Own ship restrictions ---
+    ...restrictionSymbol("CTYARE", [], config).map((l) => ({
+      ...l,
+      filter: filterD,
+    })),
+
+    // --- RESTRN other (9-22) without any higher-priority restriction ---
+    {
+      type: "symbol",
+      filter: filterOther,
+      layout: { "icon-image": "INFARE51", "icon-allow-overlap": true },
+    },
+    {
+      type: "line",
+      filter: filterOther,
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CHMGD"),
+      },
+    },
+
+    // --- Continuation E: No RESTRN → symbol by CATREA ---
+    {
+      type: "symbol",
+      filter: filterNoRestrn,
+      layout: {
+        "icon-image": [
+          "case",
+          [
+            "all",
+            ["has", "CATREA"],
+            listIncludes("CATREA", ...CATREA_MILITARY),
+          ],
+          "CTYARE51",
+          ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_NATURE)],
+          "INFARE51",
+          "RSRDEF51",
+        ] as ExpressionSpecification,
+        "icon-allow-overlap": true,
+      },
+    },
+    {
+      type: "line",
+      filter: filterNoRestrn,
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CHMGD"),
+      },
+    },
+  ];
+}
+
+/**
+ * RESTRN01 - 13.2.10 Entry procedure for restrictions
+ * (S-52 PresLib 4.0, section 13.2.10)
+ *
+ * Called for many object classes (ACHARE, CBLARE, DRGARE, FAIRWY, etc.)
+ * when they carry the RESTRN attribute. Delegates to RESCSP02.
+ */
+export function RESTRN01(config: LayerConfig): Partial<LayerSpecification>[] {
+  return RESCSP02(config);
+}
+
+/**
+ * RESCSP02 - 13.2.11 Restriction sub-procedure
+ * (S-52 PresLib 4.0, section 13.2.11)
+ *
+ * Same priority cascade as RESARE04 but without CATREA checks,
+ * since these object classes don't have CATREA.
+ */
+export function RESCSP02(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode } = config;
+
+  const hasRestrn: ExpressionFilterSpecification = ["has", "RESTRN"];
+  const hasEntry = listIncludes("RESTRN", ...RESTRN_ENTRY);
+  const hasAnchor = listIncludes("RESTRN", ...RESTRN_ANCHOR);
+  const hasFishing = listIncludes("RESTRN", ...RESTRN_FISHING);
+  const hasOwnShip = listIncludes("RESTRN", ...RESTRN_OWN_SHIP);
+
+  const fEntry: ExpressionFilterSpecification = ["all", hasRestrn, hasEntry];
+  const fAnchor: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    hasAnchor,
+  ];
+  const fFishing: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    ["!", hasAnchor],
+    hasFishing,
+  ];
+  const fOwnShip: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    ["!", hasAnchor],
+    ["!", hasFishing],
+    hasOwnShip,
+  ];
+  const fOther: ExpressionFilterSpecification = [
+    "all",
+    hasRestrn,
+    ["!", hasEntry],
+    ["!", hasAnchor],
+    ["!", hasFishing],
+    ["!", hasOwnShip],
+  ];
+
+  return [
+    {
+      type: "symbol",
+      filter: fEntry,
+      layout: { "icon-image": "ENTRES51", "icon-allow-overlap": true },
+    },
+    {
+      type: "symbol",
+      filter: fAnchor,
+      layout: { "icon-image": "ACHRES51", "icon-allow-overlap": true },
+    },
+    {
+      type: "symbol",
+      filter: fFishing,
+      layout: { "icon-image": "FSHRES51", "icon-allow-overlap": true },
+    },
+    {
+      type: "symbol",
+      filter: fOwnShip,
+      layout: { "icon-image": "CTYARE51", "icon-allow-overlap": true },
+    },
+    {
+      type: "symbol",
+      filter: fOther,
+      layout: { "icon-image": "INFARE51", "icon-allow-overlap": true },
+    },
+    {
+      type: "line",
+      filter: hasRestrn,
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 2,
+        "line-color": colour(mode, "CHMGD"),
+      },
+    },
+  ];
+}
 
 /** SAFCON01 - 13.2.12 Contour labels, including safety contour */
 export function SAFECON01(config: LayerConfig): Partial<LayerSpecification>[] {
