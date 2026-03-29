@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Converts a single S57 ENC file to a GeoPackage with chart metadata.
+#
+# Usage: bin/s57-to-gpkg input.000 output.gpkg
+#
+# Each feature is tagged with DSNM (source chart name) and INTU (intended use /
+# navigational purpose), enabling downstream quilting queries that resolve
+# overlapping chart coverage.
+#
+# Designed to run in parallel via make -j, with individual GPKGs merged later
+# by bin/merge-gpkg.
+
+set -e
+
+if [ $# -lt 2 ]; then
+  echo "Usage: $0 input.000 output.gpkg"
+  exit 1
+fi
+
+input="$1"
+output="$2"
+
+export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON"
+
+dsnm=$(ogrinfo -q "$input" DSID 2>/dev/null | grep DSID_DSNM | awk -F'= ' '{print $2}')
+intu=$(ogrinfo -q "$input" DSID 2>/dev/null | grep DSID_INTU | awk '{print $NF}')
+
+if [ -z "$intu" ]; then
+  echo "Skipping $input: could not read DSID_INTU"
+  exit 1
+fi
+
+mkdir -p "$(dirname "$output")"
+
+# GPKG doesn't support StringList natively, so GDAL automatically converts
+# list-type attributes (COLOUR, RESTRN, etc.) to String(JSON) — e.g. '["3","4","3"]'.
+# This matches the encoding expected by S-52 styles after tippecanoe serialization.
+ogr2ogr -f GPKG "$output" "$input" \
+  -skipfailures 2>/dev/null
+
+# Tag all features with chart metadata.
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('${output}')
+conn.enable_load_extension(True)
+conn.load_extension('mod_spatialite')
+tables = [r[0] for r in conn.execute(
+    \"SELECT table_name FROM gpkg_contents WHERE data_type='features'\"
+).fetchall()]
+for t in tables:
+    conn.execute(f'ALTER TABLE \"{t}\" ADD COLUMN DSNM TEXT')
+    conn.execute(f'ALTER TABLE \"{t}\" ADD COLUMN INTU INTEGER')
+    conn.execute(f'UPDATE \"{t}\" SET DSNM = ?, INTU = ?', ('${dsnm}', ${intu}))
+conn.commit()
+conn.close()
+"

@@ -2,8 +2,9 @@ import {
   DataDrivenPropertyValueSpecification,
   SymbolLayerSpecification,
 } from "maplibre-gl";
-import { Reference } from "./parser";
+import { Reference } from "./parser.js";
 import { symbols } from "@enc-tiles/s52";
+import type { LayerConfig } from "../symbolology/index.js";
 
 /**
  * SY – Showpoint, Show symbol command.
@@ -30,6 +31,7 @@ import { symbols } from "@enc-tiles/s52";
  * degrees clockwise from 0 to 360. The default value is 0 degrees."
  */
 export function SY(
+  _config: LayerConfig,
   symbol: Reference,
   rot: number | Reference = 0,
 ): Pick<SymbolLayerSpecification, "type" | "layout">[] {

@@ -1,13 +1,31 @@
 ENC_DIR := data/ENC_ROOT
 TILES_DIR := tiles
+GPKG_DIR := $(TILES_DIR)/gpkg
 ENC := $(wildcard $(ENC_DIR)/**/*.000)
-TILES := $(patsubst $(ENC_DIR)/%.000,$(TILES_DIR)/%.pmtiles,$(ENC))
-TILEJSON := $(patsubst $(ENC_DIR)/%.000,$(TILES_DIR)/%.json,$(ENC))
+GPKGS := $(patsubst $(ENC_DIR)/%.000,$(GPKG_DIR)/%.gpkg,$(ENC))
 
-.PHONY: all clean data
+.PHONY: all clean data gpkg tiles
 
-all: $(TILES_DIR)/catalog.json ${TILES_DIR}/noaa.pmtiles
+# Pipeline: S57 → individual GPKGs (parallel) → merged GPKG → quilted PMTiles
+all: $(TILES_DIR)/noaa.pmtiles
 
+# Step 1: Convert each S57 chart to its own GeoPackage (parallelizable with make -j)
+$(GPKG_DIR)/%.gpkg: $(ENC_DIR)/%.000
+	bin/s57-to-gpkg $< $@
+
+# Step 2: Merge all individual GPKGs into one
+gpkg: $(TILES_DIR)/noaa.gpkg
+
+$(TILES_DIR)/noaa.gpkg: $(GPKGS)
+	bin/merge-gpkg $@ $^
+
+# Step 3: Generate PMTiles from the merged GeoPackage
+tiles: $(TILES_DIR)/noaa.pmtiles
+
+$(TILES_DIR)/noaa.pmtiles: $(TILES_DIR)/noaa.gpkg
+	bin/gpkg-to-tiles $< $@
+
+# Download NOAA ENC data
 data:
 	@mkdir -p data
 	@echo "Downloading NOAA ENC data..."
@@ -15,20 +33,5 @@ data:
 	@echo "Extracting ENC data..."
 	unzip -o data/ALL_ENCs.zip -d data
 
-$(TILES_DIR)/%.pmtiles: $(ENC_DIR)/%.000
-	bin/s57-to-tiles $< $@
-
-${TILES_DIR}/%.json: ${TILES_DIR}/%.pmtiles
-	pmtiles show --tilejson $< > $@
-
-${TILES_DIR}/noaa.pmtiles: $(TILES)
-	# Increase file descriptor limit for tile-join
-	ulimit -n 100000; \
-	tile-join --force --no-tile-size-limit -o $@ $(TILES_DIR)/**/*.pmtiles
-
 clean:
 	rm -rf $(TILES_DIR)
-
-${TILES_DIR}/catalog.json: $(TILEJSON)
-	@rm -f $(TILES_DIR)/catalog.json
-	bin/catalog $(TILES_DIR)/**/*.json > $@

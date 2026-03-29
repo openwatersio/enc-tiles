@@ -2,10 +2,19 @@ import { describe, expect, test } from "vitest";
 import { instructionsToStyles } from "../../src/instructions/index.js";
 import { formatAttribute } from "../../src/instructions/SHOWTEXT.js";
 import { SymbolLayerSpecification } from "maplibre-gl";
+import { LayerConfig } from "../../src/symbolology/index.js";
+
+const config: LayerConfig = {
+  source: "enc",
+  mode: "DAY",
+  shallowDepth: 3.0,
+  safetyDepth: 6.0,
+  deepDepth: 9.0,
+};
 
 describe("TX", () => {
   test("TX('Hello World')", () => {
-    const styles = instructionsToStyles("TX('Hello World')");
+    const styles = instructionsToStyles("TX('Hello World')", config);
     expect(styles).toHaveLength(1);
     const style = styles[0] as SymbolLayerSpecification;
     expect(style.type).toBe("symbol");
@@ -16,6 +25,7 @@ describe("TX", () => {
   test("TX(OBJNAM,1,2,3,'15110',0,0,CHBLK,26)", () => {
     const style = instructionsToStyles(
       `TX(OBJNAM,1,2,3,'15110',0,0,CHBLK,26)`,
+      config,
     )[0] as SymbolLayerSpecification;
     expect(style.layout?.["text-field"]).toEqual(["get", "OBJNAM"]);
     expect(style.layout?.["text-anchor"]).toEqual("center");
@@ -36,6 +46,7 @@ describe("TX", () => {
       test(`CHARS=${chars} => ${expected}`, () => {
         const style = instructionsToStyles(
           `TX('Hello',1,1,1,'${chars}')`,
+          config,
         )[0] as SymbolLayerSpecification;
         expect(style.layout?.["text-size"]).toEqual(expected);
       });
@@ -57,6 +68,7 @@ describe("TX", () => {
       test(`HJUST=${hjust} VJUST=${vjust} => ${expected}`, () => {
         const style = instructionsToStyles(
           `TX('Hello',${hjust},${vjust})`,
+          config,
         )[0] as SymbolLayerSpecification;
         expect(style.layout?.["text-anchor"]).toEqual(expected);
       });
@@ -68,6 +80,7 @@ describe("TE", () => {
   test(`TE('Nr %s','OBJNAM',3,1,2,'15110',1,0,CHBLK,29)`, () => {
     const style = instructionsToStyles(
       `TE('Nr %s','OBJNAM',3,1,2,'15110',1,0,CHBLK,29)`,
+      config,
     )[0] as SymbolLayerSpecification;
     expect(style.layout?.["text-field"]).toEqual([
       "format",
@@ -79,6 +92,7 @@ describe("TE", () => {
   test(`TE('%03.0lf deg','ORIENT',1,1,2,'15110',0,-1,CHBLK,11)`, () => {
     const style = instructionsToStyles(
       `TE('%03.0lf deg','ORIENT',1,1,2,'15110',0,-1,CHBLK,11)`,
+      config,
     )[0] as SymbolLayerSpecification;
     expect(style.layout?.["text-field"]).toEqual([
       "format",

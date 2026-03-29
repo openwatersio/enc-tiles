@@ -1,31 +1,38 @@
-import { Mode } from "@enc-tiles/s52";
 import type {
   StyleSpecification,
   VectorSourceSpecification,
 } from "maplibre-gl";
-import { build, LayerConfig } from "./symbolology/index.js";
+import { build, type LayerConfig } from "./symbolology/index.js";
+export { BoundaryType, SymbolType } from "./symbolology/index.js";
+export type {
+  DisplayCategory,
+  LayerConfig,
+  TextGroup,
+} from "./symbolology/index.js";
 
-export interface StyleOptions {
+export interface StyleOptions extends Partial<Omit<LayerConfig, "source">> {
   source: VectorSourceSpecification;
   name?: string;
-  mode?: Mode;
   sprite?: string;
 }
+
+// S-52 PresLib 4.0, SEABED01 (section 13.2.15) and SNDFRM04 (section 13.2.16)
+const defaults: Omit<LayerConfig, "mode"> = {
+  source: "enc",
+  shallowContour: 2.0,
+  safetyContour: 30.0,
+  deepContour: 30.0,
+  safetyDepth: 30.0,
+};
 
 export default function ({
   source,
   name = "S52 Style",
   mode = "DAY",
   sprite,
+  ...options
 }: StyleOptions): StyleSpecification {
-  const config: LayerConfig = {
-    mode,
-    source: "enc",
-    shallowDepth: 3.0, // meters (9.8 feet)
-    safetyDepth: 6.0, // meters (19.6 feet)
-    deepDepth: 9.0, // meters (29.5 feet)
-  };
-
+  const config: LayerConfig = { ...defaults, mode, ...options };
   const layers = build(config);
 
   return {

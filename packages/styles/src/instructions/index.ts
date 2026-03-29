@@ -5,6 +5,7 @@ import { LC, LS } from "./SHOWLINE.js";
 import { SY } from "./SHOWPOINT.js";
 import { TX, TE } from "./SHOWTEXT.js";
 import type { LayerSpecification } from "maplibre-gl";
+import type { LayerConfig } from "../symbolology/index.js";
 
 export * from "./parser.js";
 export * from "./CALLSYMPROC.js";
@@ -17,6 +18,7 @@ const commands = { AC, AP, CS, LC, LS, SY, TE, TX };
 
 export function instructionsToStyles(
   instruction: string | undefined,
+  config: LayerConfig,
 ): Partial<LayerSpecification>[] {
   if (typeof instruction !== "string") return [];
 
@@ -28,7 +30,7 @@ export function instructionsToStyles(
         throw new Error(`Unknown command: ${instruction.command}`);
       }
 
-      return command(...instruction.params);
+      return command(config, ...instruction.params);
     })
     .filter(Boolean);
 }

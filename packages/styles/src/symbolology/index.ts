@@ -1,4 +1,4 @@
-import s52, { colours, Mode } from "@enc-tiles/s52";
+import s52, { colour, Mode } from "@enc-tiles/s52";
 import type {
   BackgroundLayerSpecification,
   ExpressionFilterSpecification,
@@ -11,14 +11,26 @@ import { instructionsToStyles } from "../instructions/index.js";
 import * as filters from "../filters.js";
 import { groupBy } from "../utils.js";
 
+export type DisplayCategory = "DISPLAYBASE" | "STANDARD" | "OTHER";
+export type TextGroup = "important" | "other";
+
 export interface LayerConfig {
   mode: Mode;
   source: string;
-  shallowDepth: number;
+  /** SHALLOW_CONTOUR: depth area colouring threshold (S-52 default: 2m) */
+  shallowContour: number;
+  /** SAFETY_CONTOUR: isolated danger and safety contour threshold (S-52 default: 30m) */
+  safetyContour: number;
+  /** DEEP_CONTOUR: depth area colouring threshold (S-52 default: 30m) */
+  deepContour: number;
+  /** SAFETY_DEPTH: sounding colour threshold (S-52 default: 30m) */
   safetyDepth: number;
-  deepDepth: number;
   boundaries?: BoundaryType;
   symbols?: SymbolType;
+  /** Display categories to show. Omit to show all. */
+  displayCategories?: Set<DisplayCategory>;
+  /** Text groups to show. Omit to show all. */
+  textGroups?: Set<TextGroup>;
 }
 
 export enum BoundaryType {
@@ -51,9 +63,9 @@ export function build(config: LayerConfig): LayerSpecification[] {
         );
 
       if (lookups.length <= 1) {
-        return lookups.flatMap(lookupToLayers);
+        return lookups.flatMap((l) => lookupToLayers(l, config));
       } else {
-        return lookupGroupToLayers(lookups);
+        return lookupGroupToLayers(lookups, config);
       }
     },
   );
@@ -76,8 +88,15 @@ export function build(config: LayerConfig): LayerSpecification[] {
  */
 export function lookupGroupToLayers(
   lookups: LookupEntry[],
+  config: LayerConfig,
 ): LayerSpecification[] {
-  const [fallbackLookup, ...otherLookups] = lookups;
+  // Per S-52 10.3.3.1, the fallback entry is the one with no attribute conditions.
+  const fallbackIndex = lookups.findIndex((l) => l.attc.length === 0);
+  const fallbackLookup =
+    fallbackIndex >= 0 ? lookups[fallbackIndex] : lookups[0];
+  const otherLookups = lookups.filter(
+    (_, i) => i !== (fallbackIndex >= 0 ? fallbackIndex : 0),
+  );
 
   const fallbackFilter: FilterSpecification = [
     "!",
@@ -89,7 +108,7 @@ export function lookupGroupToLayers(
     ],
   ];
   return [
-    ...lookupToLayers(fallbackLookup!).map((layer) => ({
+    ...lookupToLayers(fallbackLookup!, config).map((layer) => ({
       ...layer,
       ...("filter" in layer
         ? {
@@ -100,14 +119,26 @@ export function lookupGroupToLayers(
           }
         : {}),
     })),
-    ...otherLookups.flatMap(lookupToLayers),
+    ...otherLookups.flatMap((l) => lookupToLayers(l, config)),
   ];
 }
 
-let i = 0;
+function lookupId(lookup: LookupEntry): string {
+  const parts = [lookup.obcl, lookup.ftyp];
+  if (lookup.attc.length > 0) {
+    parts.push(lookup.attc.map((c) => `${c.attl}${c.attv ?? ""}`).join("_"));
+  }
+  return parts.join("-");
+}
 
-export function lookupToLayers(lookup: LookupEntry): LayerSpecification[] {
-  return instructionsToStyles(lookup.inst).map((layer) => {
+export function lookupToLayers(
+  lookup: LookupEntry,
+  config: LayerConfig,
+): LayerSpecification[] {
+  const baseId = lookupId(lookup);
+  return instructionsToStyles(lookup.inst, config).map((layer, index) => {
+    const visibility = layerVisibility(lookup, layer, config);
+
     return {
       ...layer,
       metadata: {
@@ -124,10 +155,11 @@ export function lookupToLayers(lookup: LookupEntry): LayerSpecification[] {
       layout: {
         ...layer.layout,
         [`${layer.type}-sort-key`]: sortKey(lookup.dpri, layer),
+        ...(visibility === "none" ? { visibility } : {}),
       },
       source: "enc",
       "source-layer": lookup.obcl,
-      id: [i++, lookup.obcl, lookup.ftyp].join("-"),
+      id: `${baseId}-${index}`,
     };
   });
 }
@@ -137,7 +169,7 @@ function background({ mode }: LayerConfig): BackgroundLayerSpecification {
     id: "background",
     type: "background",
     paint: {
-      "background-color": colours[mode].NODTA,
+      "background-color": colour(mode, "NODTA"),
     },
   };
 }
@@ -160,6 +192,34 @@ export function getLookups({
   ];
 
   return s52.lookups.filter((l) => sets.includes(l.tnam)) as LookupEntry[];
+}
+
+/**
+ * Determine layer visibility based on display category and text group settings.
+ */
+function layerVisibility(
+  lookup: LookupEntry,
+  layer: Partial<LayerSpecification>,
+  config: LayerConfig,
+): "visible" | "none" {
+  // Check display category
+  if (config.displayCategories && lookup.disc) {
+    if (!config.displayCategories.has(lookup.disc as DisplayCategory)) {
+      return "none";
+    }
+  }
+
+  // Check text group
+  const textDisplay = (layer as { metadata?: { "s52:display"?: string } })
+    .metadata?.["s52:display"];
+  if (config.textGroups && textDisplay) {
+    const group: TextGroup = textDisplay === "50" ? "other" : "important";
+    if (!config.textGroups.has(group)) {
+      return "none";
+    }
+  }
+
+  return "visible";
 }
 
 const TypePriority = { symbol: 1, line: 2, fill: 3 };

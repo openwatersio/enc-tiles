@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Merges multiple GeoPackage files into a single GeoPackage.
+#
+# Usage: bin/merge-gpkg output.gpkg input1.gpkg [input2.gpkg ...]
+#
+# Uses SQLite ATTACH for fast bulk merging without serialization overhead.
+# Tables that exist in both source and destination get their rows appended.
+# Tables unique to the source are copied with full GPKG metadata registration.
+
+set -e
+
+if [ $# -lt 2 ]; then
+  echo "Usage: $0 output.gpkg input1.gpkg [input2.gpkg ...]"
+  exit 1
+fi
+
+output="$1"
+shift
+
+# Use the first input as the base
+echo "Base: $(basename "$1")"
+cp "$1" "$output"
+shift
+
+# Merge remaining inputs via ATTACH
+for input in "$@"; do
+  echo "Merging: $(basename "$input")"
+
+  python3 -c "
+import sqlite3
+
+conn = sqlite3.connect('${output}')
+conn.enable_load_extension(True)
+conn.load_extension('mod_spatialite')
+conn.execute(\"ATTACH DATABASE '${input}' AS src\")
+
+src_tables = [r[0] for r in conn.execute(
+    \"SELECT table_name FROM src.gpkg_contents WHERE data_type='features'\"
+).fetchall()]
+dst_tables = [r[0] for r in conn.execute(
+    \"SELECT table_name FROM gpkg_contents WHERE data_type='features'\"
+).fetchall()]
+
+for table in src_tables:
+    if table in dst_tables:
+        # Shared table: insert rows for matching columns
+        src_cols = [r[1] for r in conn.execute(f'PRAGMA src.table_info(\"{table}\")').fetchall()]
+        dst_cols = [r[1] for r in conn.execute(f'PRAGMA main.table_info(\"{table}\")').fetchall()]
+        common = [c for c in src_cols if c in dst_cols and c != 'fid']
+        cols_str = ', '.join(f'\"{c}\"' for c in common)
+        conn.execute(f'INSERT INTO main.\"{table}\" ({cols_str}) SELECT {cols_str} FROM src.\"{table}\"')
+    else:
+        # New table: copy structure and data
+        create_sql = conn.execute(
+            f\"SELECT sql FROM src.sqlite_master WHERE type='table' AND name='{table}'\"
+        ).fetchone()[0]
+        conn.execute(create_sql)
+        conn.execute(f'INSERT INTO main.\"{table}\" SELECT * FROM src.\"{table}\"')
+
+        # Register in GPKG metadata tables
+        for meta_table in ['gpkg_contents', 'gpkg_geometry_columns', 'gpkg_ogr_contents']:
+            try:
+                row = conn.execute(f\"SELECT * FROM src.{meta_table} WHERE table_name='{table}'\").fetchone()
+                if row:
+                    ncols = len(conn.execute(f'PRAGMA table_info({meta_table})').fetchall())
+                    placeholders = ','.join(['?'] * ncols)
+                    conn.execute(f'INSERT INTO {meta_table} VALUES ({placeholders})', row)
+            except Exception:
+                pass
+
+conn.commit()
+conn.execute('DETACH DATABASE src')
+conn.close()
+"
+done
+
+echo "Done: $output"

@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# Converts a GeoPackage of merged S57 chart data into PMTiles via tippecanoe.
+#
+# Usage: bin/gpkg-to-tiles input.gpkg output.pmtiles
+#
+# The GPKG should have been created by bin/s57-to-gpkg, with DSNM and INTU
+# columns on each feature table.
+#
+# Quilting: For each feature, the script checks if a higher-detail chart's
+# M_COVR coverage polygon covers that feature's location. If so, the feature's
+# maxzoom is capped at the zoom where the higher-detail chart begins. If not,
+# the feature overzooms to z16 — showing coarse data rather than nothing.
+#
+# Pipeline: GPKG → GeoJSON per layer (with quilted zoom hints) → tippecanoe → PMTiles
+
+set -e
+
+if [ $# -lt 2 ]; then
+  echo "Usage: $0 input.gpkg output.pmtiles"
+  exit 1
+fi
+
+input="$1"
+output="$2"
+
+mkdir -p "$(dirname "$output")"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+# Get all feature layers (excluding metadata-only tables)
+layers=$(ogrinfo -q "$input" 2>/dev/null | grep "^[0-9]" | awk '{print $2}' \
+  | grep -v '^DSID$' \
+  | grep -v '^C_AGGR$' \
+  | grep -v '^C_ASSO$')
+
+# Excluded attributes (internal S57 bookkeeping, not needed in tiles)
+excludes="LNAM_REFS,FFPT_RIND,LNAM,PRIM,GRUP,OBJL,RVER,AGEN,FIDN,FIDS,RECDAT,RECIND,SORDAT,SORIND,RCID"
+
+echo "Exporting layers from GeoPackage..."
+
+geojson_files=()
+
+for layer in $layers; do
+  geojson="$tmpdir/$layer.geojson"
+  ogr2ogr -f GeoJSON "$geojson" "$input" "$layer" 2>/dev/null || continue
+
+  if [ -s "$geojson" ]; then
+    geojson_files+=("$geojson")
+  fi
+done
+
+if [ ${#geojson_files[@]} -eq 0 ]; then
+  echo "No features found in $input"
+  exit 1
+fi
+
+echo "Quilting ${#geojson_files[@]} layers (resolving chart overlaps)..."
+
+# Quilt: assign per-feature minzoom/maxzoom based on INTU and M_COVR coverage.
+# Features overzoom (persist to higher zooms) unless a higher-detail chart
+# covers the same area — then they're capped at the zoom where the
+# higher-detail chart takes over.
+GPKG_PATH="$input" GEOJSON_DIR="$tmpdir" python3 << 'PYTHON_SCRIPT'
+import sqlite3
+import json
+import os
+import glob
+
+gpkg_path = os.environ['GPKG_PATH']
+tmpdir = os.environ['GEOJSON_DIR']
+
+# INTU → (minzoom, default_maxzoom) mapping.
+# default_maxzoom is the zoom ceiling for a feature's own band.
+# Features overzoom BEYOND this only where no higher-detail chart exists.
+ZOOM_BANDS = {
+    1: (0, 6),    # Overview
+    2: (7, 8),    # General
+    3: (9, 10),   # Coastal
+    4: (11, 12),  # Approach
+    5: (13, 14),  # Harbour
+    6: (15, 16),  # Berthing
+}
+# How many zoom levels to allow overzooming beyond the band ceiling.
+# This is a balance: too many = huge tiles, too few = blank areas.
+# A feature at INTU=3 (coastal, maxzoom=10) can overzoom to 10+OVERZOOM_LIMIT
+# if no higher-detail chart covers its location.
+OVERZOOM_LIMIT = 4
+MAX_ZOOM = 16
+
+# Connect to GPKG with SpatiaLite for spatial queries
+conn = sqlite3.connect(gpkg_path)
+conn.enable_load_extension(True)
+conn.load_extension('mod_spatialite')
+
+# Preload M_COVR coverage polygons (CATCOV=1) for quilting lookups.
+print("  Loading M_COVR coverage polygons...")
+mcovr_count = conn.execute(
+    "SELECT count(*) FROM M_COVR WHERE CATCOV = 1"
+).fetchone()[0]
+print(f"  {mcovr_count} coverage polygons across all charts")
+
+def get_maxzoom(conn, intu, lon, lat):
+    """Determine maxzoom for a feature using M_COVR quilting.
+
+    Strategy:
+    - Default maxzoom = band ceiling (e.g. z10 for coastal INTU=3)
+    - If a higher-detail chart covers this point: cap at that chart's
+      minzoom - 1 (no overlap, higher chart takes over)
+    - If NO higher-detail chart covers this point: allow overzooming
+      up to band ceiling + OVERZOOM_LIMIT, so the feature remains visible
+      at higher zooms rather than showing blank space
+    """
+    if intu is None:
+        return MAX_ZOOM
+
+    band = ZOOM_BANDS.get(int(intu))
+    if band is None:
+        return MAX_ZOOM
+
+    _, default_max = band
+
+    if intu >= 6:
+        return default_max
+
+    row = conn.execute('''
+        SELECT MIN(INTU) FROM M_COVR
+        WHERE CATCOV = 1 AND INTU > ?
+        AND ST_Contains(CastAutomagic(geom), MakePoint(?, ?, 4326))
+    ''', (intu, lon, lat)).fetchone()
+
+    if row[0] is not None:
+        # Higher-detail chart covers this point — cap at its minzoom - 1
+        next_intu = row[0]
+        next_min, _ = ZOOM_BANDS[next_intu]
+        return next_min - 1
+
+    # No higher-detail coverage — allow limited overzooming
+    return min(default_max + OVERZOOM_LIMIT, MAX_ZOOM)
+
+# Process each GeoJSON file
+geojson_files = sorted(glob.glob(os.path.join(tmpdir, '*.geojson')))
+for filepath in geojson_files:
+    layer_name = os.path.splitext(os.path.basename(filepath))[0]
+
+    with open(filepath) as f:
+        data = json.load(f)
+
+    features = data.get('features', [])
+    if not features:
+        continue
+
+    modified = 0
+    for feat in features:
+        props = feat.get('properties', {})
+        intu = props.get('INTU')
+        geom = feat.get('geometry')
+
+        if intu is None or geom is None:
+            continue
+
+        intu = int(intu)
+        band = ZOOM_BANDS.get(intu)
+        minzoom = band[0] if band else 0
+
+        # Get representative point for coverage check
+        coords = geom.get('coordinates')
+        geom_type = geom.get('type', '')
+
+        try:
+            if geom_type == 'Point':
+                lon, lat = coords[0], coords[1]
+            elif geom_type == 'MultiPoint':
+                lon, lat = coords[0][0], coords[0][1]
+            elif geom_type in ('LineString', 'MultiLineString'):
+                # Use midpoint of first linestring
+                line = coords[0] if geom_type == 'MultiLineString' else coords
+                mid = line[len(line) // 2]
+                lon, lat = mid[0], mid[1]
+            elif geom_type == 'Polygon':
+                # Use centroid approximation (average of exterior ring)
+                ring = coords[0]
+                lon = sum(c[0] for c in ring) / len(ring)
+                lat = sum(c[1] for c in ring) / len(ring)
+            elif geom_type == 'MultiPolygon':
+                ring = coords[0][0]
+                lon = sum(c[0] for c in ring) / len(ring)
+                lat = sum(c[1] for c in ring) / len(ring)
+            else:
+                feat['tippecanoe'] = {'minzoom': minzoom, 'maxzoom': MAX_ZOOM}
+                modified += 1
+                continue
+        except (IndexError, TypeError):
+            feat['tippecanoe'] = {'minzoom': minzoom, 'maxzoom': MAX_ZOOM}
+            modified += 1
+            continue
+
+        maxzoom = get_maxzoom(conn, intu, lon, lat)
+        feat['tippecanoe'] = {'minzoom': minzoom, 'maxzoom': maxzoom}
+        modified += 1
+
+    if modified > 0:
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+        print(f"  {layer_name}: {modified} features quilted")
+
+conn.close()
+print("  Quilting complete.")
+PYTHON_SCRIPT
+
+echo "Generating tiles..."
+
+# Build tippecanoe exclude flags
+exclude_flags=""
+IFS=',' read -ra excl_arr <<< "$excludes"
+for field in "${excl_arr[@]}"; do
+  exclude_flags="$exclude_flags --exclude=$field"
+done
+
+tippecanoe \
+  -o "$output" \
+  --force \
+  --no-tile-size-limit \
+  --minimum-zoom=0 \
+  --maximum-zoom=16 \
+  $exclude_flags \
+  "${geojson_files[@]}"
+
+echo "Done: $output"

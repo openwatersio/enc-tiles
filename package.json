@@ -19,7 +19,8 @@
   "scripts": {
     "prepare": "husky",
     "build": "npm run --workspaces --if-present build",
-    "test": "npm run --workspaces --if-present test -- --run",
+    "typecheck": "tsc -b",
+    "test": "vitest",
     "start": "vite dev",
     "lint": "prettier --check .",
     "format": "prettier --write ."
