@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Converts an S57 ENC file to PMTiles.
+#
+# Usage: bin/s57-to-tiles input.000 output.pmtiles
+#
+# Pipeline:
+#   S57 → ogr2ogr → GPKG (transient)
+#     → SpatiaLite preprocessing (compute attributes MapLibre can't derive)
+#     → ogr2ogr → GeoJSON (list attrs as comma-separated strings)
+#     → tippecanoe → PMTiles
+#
+# The GPKG intermediate enables spatial queries for S-52 Conditional Symbology
+# Procedures that need cross-feature lookups (e.g. "is this wreck inside a
+# depth area?"). LIST_AS_STRING=ON converts S-57 list-type attributes to
+# comma-separated strings at read time.
+#
+# See docs/s57-to-tiles.md for attribute encoding details.
+
+set -e
+
+VERBOSE=${VERBOSE:-0}
+[ "$VERBOSE" = "1" ] && set -x
+
+if [ $# -lt 2 ]; then
+  echo "Usage: $0 input.000 output.pmtiles"
+  exit 1
+fi
+
+input="$1"
+output="$2"
+
+export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON,LIST_AS_STRING=ON"
+
+# Extract INTU from the DSID metadata layer
+dsid=$(ogrinfo -q "$input" DSID 2>/dev/null)
+intu=$(echo "$dsid" | grep DSID_INTU | awk '{print $NF}')
+
+if [ -z "$intu" ]; then
+  echo "Skipping $input: could not read DSID_INTU"
+  exit 1
+fi
+
+# INTU → zoom range
+case "$intu" in
+  1) minzoom=0;  maxzoom=6  ;;
+  2) minzoom=7;  maxzoom=8  ;;
+  3) minzoom=9;  maxzoom=10 ;;
+  4) minzoom=11; maxzoom=12 ;;
+  5) minzoom=13; maxzoom=14 ;;
+  6) minzoom=15; maxzoom=16 ;;
+  *) echo "Unknown INTU: $intu"; exit 1 ;;
+esac
+
+mkdir -p "$(dirname "$output")"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+gpkg="$tmpdir/chart.gpkg"
+
+# Step 1: Convert S57 to a transient GeoPackage for spatial preprocessing
+ogr2ogr -f GPKG "$gpkg" "$input" -skipfailures 2>/dev/null
+
+# Step 2: Pre-compute attributes that require spatial cross-feature queries.
+# These support S-52 CSPs that MapLibre can't evaluate at render time.
+
+# List available feature tables
+tables=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}')
+
+# UDWHAZ05: Store the DRVAL1 of the containing DEPARE on WRECKS and OBSTRN.
+# The style uses this at render time to evaluate isolated danger status
+# against the user's configured safety contour.
+if echo "$tables" | grep -q '^DEPARE$'; then
+  for hazard_table in WRECKS OBSTRN; do
+    echo "$tables" | grep -q "^${hazard_table}$" || continue
+    ogrinfo --quiet "$gpkg" -dialect sqlite \
+      -sql "ALTER TABLE \"${hazard_table}\" ADD COLUMN _DEPARE_DRVAL1 REAL"
+    ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+      UPDATE \"${hazard_table}\" SET _DEPARE_DRVAL1 = (
+        SELECT d.DRVAL1 FROM DEPARE d
+        WHERE ST_Contains(CastAutomagic(d.geom), CastAutomagic(\"${hazard_table}\".geom))
+        LIMIT 1
+      )"
+  done
+fi
+
+# TOPMAR01: Determine if topmark is on a floating platform (buoy, light float,
+# light vessel) or a rigid one (beacon, daymark). Different symbol tables apply.
+if echo "$tables" | grep -q '^TOPMAR$'; then
+  ogrinfo --quiet "$gpkg" -dialect sqlite \
+    -sql "ALTER TABLE TOPMAR ADD COLUMN _FLOATING INTEGER DEFAULT 0"
+  for float_table in BOYLAT BOYSAW BOYSPP BOYCAR BOYINB BOYISD LITFLT LITVES; do
+    echo "$tables" | grep -q "^${float_table}$" || continue
+    ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+      UPDATE TOPMAR SET _FLOATING = 1
+      WHERE EXISTS (
+        SELECT 1 FROM \"${float_table}\" f
+        WHERE ST_Distance(CastAutomagic(TOPMAR.geom), CastAutomagic(f.geom)) < 0.0001
+      )"
+  done
+fi
+
+# Step 3: Export each layer to GeoJSON for import into tippecanoe.
+layers=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}' | grep -v '^DSID$')
+
+geojson_files=()
+for layer in $layers; do
+  geojson="$tmpdir/$layer.geojson"
+  ogr2ogr -f GeoJSON "$geojson" "$gpkg" "$layer" || continue
+  if [ -s "$geojson" ]; then
+    geojson_files+=("$geojson")
+  fi
+done
+
+if [ ${#geojson_files[@]} -eq 0 ]; then
+  echo "No features found in $input"
+  exit 1
+fi
+
+# Step 4: Generate tiles. List attributes are already comma-separated strings
+# from the GeoJSON export. Each input filename becomes the layer name.
+tippecanoe \
+  -o "$output" \
+  --force \
+  --no-tile-size-limit \
+  --minimum-zoom="$minzoom" \
+  --maximum-zoom="$maxzoom" \
+  --exclude=LNAM_REFS `# feature-to-feature cross-references` \
+  --exclude=FFPT_RIND `# feature-to-feature pointer update instruction` \
+  --exclude=PRIM      `# geometry primitive type (redundant: encoded in geometry)` \
+  --exclude=GRUP      `# group number (internal S-57 ordering)` \
+  --exclude=OBJL      `# object label code (redundant: encoded as layer name)` \
+  --exclude=RVER      `# record version (update tracking)` \
+  --exclude=AGEN      `# producing agency code` \
+  --exclude=FIDN      `# feature identification number (LNAM is the cross-chart ID)` \
+  --exclude=FIDS      `# feature identification subdivision` \
+  --exclude=RECDAT    `# record date` \
+  --exclude=RECIND    `# record indicator` \
+  --exclude=SORDAT    `# source date` \
+  --exclude=SORIND    `# source indicator` \
+  --exclude=RCID      `# record identifier (internal primary key)` \
+  "${geojson_files[@]}"

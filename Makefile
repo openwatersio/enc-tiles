@@ -1,29 +1,22 @@
 ENC_DIR := data/ENC_ROOT
 TILES_DIR := tiles
-GPKG_DIR := $(TILES_DIR)/gpkg
 ENC := $(wildcard $(ENC_DIR)/**/*.000)
-GPKGS := $(patsubst $(ENC_DIR)/%.000,$(GPKG_DIR)/%.gpkg,$(ENC))
+PMTILES := $(patsubst $(ENC_DIR)/%.000,$(TILES_DIR)/%.pmtiles,$(ENC))
 
-.PHONY: all clean data gpkg tiles
+.PHONY: all clean data tiles
 
-# Pipeline: S57 → individual GPKGs (parallel) → merged GPKG → quilted PMTiles
+# Pipeline: S57 → individual PMTiles (parallel) → merged PMTiles
 all: $(TILES_DIR)/noaa.pmtiles
 
-# Step 1: Convert each S57 chart to its own GeoPackage (parallelizable with make -j)
-$(GPKG_DIR)/%.gpkg: $(ENC_DIR)/%.000
-	bin/s57-to-gpkg $< $@
+# Step 1: Convert each S57 chart to PMTiles (parallelizable with make -j)
+$(TILES_DIR)/%.pmtiles: $(ENC_DIR)/%.000
+	bin/s57-to-tiles $< $@
 
-# Step 2: Merge all individual GPKGs into one
-gpkg: $(TILES_DIR)/noaa.gpkg
-
-$(TILES_DIR)/noaa.gpkg: $(GPKGS)
-	bin/merge-gpkg $@ $^
-
-# Step 3: Generate PMTiles from the merged GeoPackage
+# Step 2: Merge all individual PMTiles into one
 tiles: $(TILES_DIR)/noaa.pmtiles
 
-$(TILES_DIR)/noaa.pmtiles: $(TILES_DIR)/noaa.gpkg
-	bin/gpkg-to-tiles $< $@
+$(TILES_DIR)/noaa.pmtiles: $(PMTILES)
+	tile-join -f -o $@ $^
 
 # Download NOAA ENC data
 data:

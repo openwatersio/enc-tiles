@@ -110,7 +110,7 @@ export function DEPCNT03(config: LayerConfig): Partial<LayerSpecification>[] {
  */
 export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
   // Colour → flare symbol mapping (S-52 spec table)
-  // COLOUR is a list attribute stored as a JSON string
+  // COLOUR is a list attribute stored as a comma-separated string
   const flareSymbol: ExpressionSpecification = [
     "case",
     // Red or white+red → LIGHTS11 (red flare)
@@ -250,7 +250,7 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
  *   e.g. "Fl(2) WR 10s 15m 15M"
  *
  * LITCHR and SIGPER are scalar. COLOUR, CATLIT, STATUS are list attributes
- * stored as JSON strings. SIGGRP is a string like "(2)" or "(2+1)".
+ * stored as comma-separated strings. SIGGRP is a string like "(2)" or "(2+1)".
  */
 function LITDSN02(config: LayerConfig): Partial<LayerSpecification>[] {
   const { mode } = config;

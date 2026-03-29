@@ -1,7 +1,6 @@
 import { test, describe, expect } from "vitest";
 import {
   attributeFilters,
-  attvToJsonString,
   listIncludes,
   listExcludes,
 } from "../src/filters.js";
@@ -49,39 +48,28 @@ describe("attributeFilters", () => {
     expect(attributeFilters(attc)).toEqual([["==", ["get", "BCNSHP"], "1"]]);
   });
 
-  test("multi-value list attributes are converted to JSON array strings", () => {
+  test("multi-value list attributes match as comma-separated strings", () => {
     const attc = [
       { attl: "COLOUR", attv: "3,4,3" },
       { attl: "BCNSHP", attv: "2" },
     ];
 
     expect(attributeFilters(attc)).toEqual([
-      ["==", ["get", "COLOUR"], '["3","4","3"]'],
+      ["==", ["get", "COLOUR"], "3,4,3"],
       ["==", ["get", "BCNSHP"], "2"],
     ]);
   });
 
-  test("single-value list attributes are also converted to JSON array strings", () => {
+  test("single-value list attributes match directly", () => {
     const attc = [
       { attl: "COLOUR", attv: "3" },
       { attl: "CATREA", attv: "27" },
     ];
 
     expect(attributeFilters(attc)).toEqual([
-      ["==", ["get", "COLOUR"], '["3"]'],
-      ["==", ["get", "CATREA"], '["27"]'],
+      ["==", ["get", "COLOUR"], "3"],
+      ["==", ["get", "CATREA"], "27"],
     ]);
-  });
-});
-
-describe("attvToJsonString", () => {
-  test("converts comma-separated values to JSON array string", () => {
-    expect(attvToJsonString("3,4,3")).toBe('["3","4","3"]');
-    expect(attvToJsonString("4,3,4")).toBe('["4","3","4"]');
-  });
-
-  test("converts single value to single-element JSON array", () => {
-    expect(attvToJsonString("3")).toBe('["3"]');
   });
 });
 
@@ -89,17 +77,17 @@ describe("listIncludes", () => {
   test("single value membership test", () => {
     expect(listIncludes("RESTRN", "7")).toEqual([
       "in",
-      '"7"',
-      ["get", "RESTRN"],
+      ",7,",
+      ["concat", ",", ["get", "RESTRN"], ","],
     ]);
   });
 
   test("multiple value membership test (any of)", () => {
     expect(listIncludes("RESTRN", "7", "8", "14")).toEqual([
       "any",
-      ["in", '"7"', ["get", "RESTRN"]],
-      ["in", '"8"', ["get", "RESTRN"]],
-      ["in", '"14"', ["get", "RESTRN"]],
+      ["in", ",7,", ["concat", ",", ["get", "RESTRN"], ","]],
+      ["in", ",8,", ["concat", ",", ["get", "RESTRN"], ","]],
+      ["in", ",14,", ["concat", ",", ["get", "RESTRN"], ","]],
     ]);
   });
 });
@@ -110,8 +98,8 @@ describe("listExcludes", () => {
       "!",
       [
         "any",
-        ["in", '"5"', ["get", "CATLIT"]],
-        ["in", '"6"', ["get", "CATLIT"]],
+        ["in", ",5,", ["concat", ",", ["get", "CATLIT"], ","]],
+        ["in", ",6,", ["concat", ",", ["get", "CATLIT"], ","]],
       ],
     ]);
   });
