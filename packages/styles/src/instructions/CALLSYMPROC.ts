@@ -1505,7 +1505,7 @@ export function SOUNDG03(config: LayerConfig): Partial<LayerSpecification>[] {
 // TOPSHP → symbol name lookup tables (S-52 PresLib 4.0, section 13.2.18)
 // Floating platforms: buoys, light floats, light vessels
 // Rigid platforms: beacons, daymarks, landmarks, etc.
-// Exported for future use when pipeline adds _FLOATING attribute
+// Used by TOPMAR01 when _FLOATING=1
 export const TOPSHP_FLOATING: Record<number, string> = {
   1: "TOPMAR02",
   2: "TOPMAR04",
@@ -1598,15 +1598,10 @@ function topshpMatch(table: Record<number, string>, fallback: string) {
  * The symbol depends on TOPSHP and whether the topmark sits on a floating
  * platform (buoy, light float) or rigid platform (beacon, daymark).
  *
- * FIXME: Determining floating vs rigid requires a spatial co-location query
- * (is there a BOY*, LITFLT, or LITVES at the same position?). MapLibre can't
- * do this at render time. Currently defaults to rigid symbols. The s57 pipeline
- * should pre-compute a _FLOATING attribute for TOPMAR features.
+ * The pipeline pre-computes _FLOATING (0 or 1) via spatial co-location query
+ * (is there a BOY*, LITFLT, or LITVES at the same position?).
  */
 export function TOPMAR01(_config: LayerConfig): Partial<LayerSpecification>[] {
-  // FIXME: When the pipeline adds _FLOATING, split into two layers:
-  //   filter: ["==", ["get", "_FLOATING"], true]  → topshpMatch(TOPSHP_FLOATING, "TMARDEF2")
-  //   filter: ["!=", ["get", "_FLOATING"], true]  → topshpMatch(TOPSHP_RIGID, "TMARDEF1")
   return [
     // No TOPSHP → question mark
     {
@@ -1614,10 +1609,22 @@ export function TOPMAR01(_config: LayerConfig): Partial<LayerSpecification>[] {
       filter: ["!", ["has", "TOPSHP"]],
       layout: { "icon-image": "QUESMRK1", "icon-allow-overlap": true },
     },
-    // Has TOPSHP → rigid platform symbol (default until _FLOATING is available)
+    // Floating platform (buoy, light float, light vessel) → TOPSHP_FLOATING
     {
       type: "symbol",
-      filter: ["has", "TOPSHP"],
+      filter: ["all", ["has", "TOPSHP"], ["==", ["get", "_FLOATING"], 1]],
+      layout: {
+        "icon-image": topshpMatch(
+          TOPSHP_FLOATING,
+          "TMARDEF2",
+        ) as ExpressionSpecification,
+        "icon-allow-overlap": true,
+      },
+    },
+    // Rigid platform (beacon, daymark, etc.) → TOPSHP_RIGID
+    {
+      type: "symbol",
+      filter: ["all", ["has", "TOPSHP"], ["!=", ["get", "_FLOATING"], 1]],
       layout: {
         "icon-image": topshpMatch(
           TOPSHP_RIGID,
