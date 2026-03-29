@@ -1642,11 +1642,13 @@ export function TOPMAR01(_config: LayerConfig): Partial<LayerSpecification>[] {
  *
  * Not called directly from lookup tables -- used as a helper by WRECKS05 and OBSTRN07.
  *
- * FIXME: The full S-52 procedure spatially queries underlying DEPARE/DRGARE areas
- * to determine if a hazard lies within safe water (DRVAL1 >= safety contour).
- * This spatial check is not possible at MapLibre render time, so we conservatively
- * show ISODGR01 for all features with VALSOU <= safetyContour. The s57 pipeline
- * should pre-compute this and add it as a feature attribute.
+ * A feature is an isolated danger when:
+ *   - VALSOU <= safetyContour (hazard is shallow enough to matter)
+ *   - _DEPARE_DRVAL1 >= safetyContour (hazard lies within safe water)
+ *   - WATLEV is NOT 1 or 2 (feature is underwater)
+ *
+ * _DEPARE_DRVAL1 is pre-computed by the pipeline via spatial query (DRVAL1 of
+ * the containing DEPARE/DRGARE polygon).
  *
  * Skipped for WATLEV 1 (partly submerged) or 2 (always dry) per spec, as these
  * are above-water dangers that don't get the isolated danger symbol.
@@ -1667,7 +1669,8 @@ export function UDWHAZ05(
 /**
  * Filter for features that are isolated dangers per UDWHAZ05:
  *   - VALSOU exists and <= safetyContour
- *   - WATLEV is NOT 1 (partly submerged) or 2 (always dry), i.e. feature is underwater
+ *   - _DEPARE_DRVAL1 >= safetyContour (hazard lies within safe water)
+ *   - WATLEV is NOT 1 (partly submerged) or 2 (always dry)
  */
 export function isolatedDanger(
   config: LayerConfig,
@@ -1676,8 +1679,7 @@ export function isolatedDanger(
     "all",
     ["has", "VALSOU"],
     ["<=", ["get", "VALSOU"], config.safetyContour],
-    // WATLEV 1 (partly submerged) and 2 (always dry) are above-water dangers
-    // that don't get the isolated danger symbol
+    [">=", ["get", "_DEPARE_DRVAL1"], config.safetyContour],
     [
       "any",
       ["!", ["has", "WATLEV"]],
