@@ -100,6 +100,55 @@ if echo "$tables" | grep -q '^TOPMAR$'; then
   done
 fi
 
+# LIGHTS06: Pre-compute co-location attributes for LIGHTS features.
+if echo "$tables" | grep -q '^LIGHTS$'; then
+  # _EXTENDED_ARC: When two sector lights share the same position and their
+  # sectors overlap, the one with the smaller arc sweep is drawn at 25mm
+  # radius instead of 20mm so the arcs don't visually overlap.
+  ogrinfo --quiet "$gpkg" -dialect sqlite \
+    -sql "ALTER TABLE LIGHTS ADD COLUMN _EXTENDED_ARC INTEGER DEFAULT 0"
+  ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+    UPDATE LIGHTS SET _EXTENDED_ARC = 1
+    WHERE SECTR1 IS NOT NULL AND SECTR2 IS NOT NULL
+      AND ROWID IN (
+        SELECT a.ROWID FROM LIGHTS a, LIGHTS b
+        WHERE a.ROWID != b.ROWID
+          AND b.SECTR1 IS NOT NULL AND b.SECTR2 IS NOT NULL
+          AND ST_Distance(CastAutomagic(a.geom), CastAutomagic(b.geom)) < 0.0001
+          AND (
+            -- a's sector overlaps b's sector (either bearing falls within the other's range).
+            -- Note: this does not handle sectors that wrap through 0°/360° (e.g. SECTR1=350,
+            -- SECTR2=10). Such wrap-through-north co-located sector pairs are very rare in
+            -- practice. If encountered, both arcs render at 20mm instead of separating.
+            (a.SECTR1 BETWEEN b.SECTR1 AND b.SECTR2)
+            OR (a.SECTR2 BETWEEN b.SECTR1 AND b.SECTR2)
+            OR (b.SECTR1 BETWEEN a.SECTR1 AND a.SECTR2)
+            OR (b.SECTR2 BETWEEN a.SECTR1 AND a.SECTR2)
+          )
+          -- Only extend the smaller sector; the larger one stays at 20mm
+          AND (
+            CASE WHEN a.SECTR2 >= a.SECTR1 THEN a.SECTR2 - a.SECTR1 ELSE a.SECTR2 - a.SECTR1 + 360 END
+          ) < (
+            CASE WHEN b.SECTR2 >= b.SECTR1 THEN b.SECTR2 - b.SECTR1 ELSE b.SECTR2 - b.SECTR1 + 360 END
+          )
+      )"
+
+  # _COLOCATED: Whether a non-sector light shares its position with other
+  # non-sector lights. Used by LIGHTS06 to offset flare angles (45° vs 135°)
+  # so co-located flares don't overlap.
+  ogrinfo --quiet "$gpkg" -dialect sqlite \
+    -sql "ALTER TABLE LIGHTS ADD COLUMN _COLOCATED INTEGER DEFAULT 0"
+  ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+    UPDATE LIGHTS SET _COLOCATED = 1
+    WHERE (SECTR1 IS NULL OR SECTR2 IS NULL)
+      AND ROWID IN (
+        SELECT a.ROWID FROM LIGHTS a, LIGHTS b
+        WHERE a.ROWID != b.ROWID
+          AND (b.SECTR1 IS NULL OR b.SECTR2 IS NULL)
+          AND ST_Distance(CastAutomagic(a.geom), CastAutomagic(b.geom)) < 0.0001
+      )"
+fi
+
 # Step 3: Export each layer to GeoJSON for import into tippecanoe.
 layers=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}' | grep -v '^DSID$')
 
@@ -115,6 +164,20 @@ done
 if [ ${#geojson_files[@]} -eq 0 ]; then
   echo "No features found in $input"
   exit 1
+fi
+
+# Step 3b: Generate sector arc and leg line geometries from LIGHTS features.
+# These are LineString approximations of the arcs and radial legs that S-52
+# LIGHTS06 requires but MapLibre can't draw natively.
+lights_geojson="$tmpdir/LIGHTS.geojson"
+sectors_geojson="$tmpdir/_LIGHTS_SECTORS.geojson"
+if [ -f "$lights_geojson" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  node "$SCRIPT_DIR/generate-sector-arcs" "$lights_geojson" "$sectors_geojson" \
+    --minzoom "$minzoom" --maxzoom "$maxzoom"
+  if [ -s "$sectors_geojson" ]; then
+    geojson_files+=("$sectors_geojson")
+  fi
 fi
 
 # Step 4: Generate tiles. List attributes are already comma-separated strings

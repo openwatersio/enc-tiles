@@ -4,9 +4,14 @@ import {
   LayerSpecification,
 } from "maplibre-gl";
 import { Reference } from "./parser.js";
-import { colour } from "@enc-tiles/s52";
+import { colour, symbols } from "@enc-tiles/s52";
 import { LineStyles } from "./SHOWLINE.js";
-import { listContains, listIncludes, quaposLowQuality } from "../filters.js";
+import {
+  listContains,
+  listIncludes,
+  quaposLowQuality,
+  scaleFilter,
+} from "../filters.js";
 import type { LayerConfig } from "../symbolology/index.js";
 
 const procs = {
@@ -22,6 +27,90 @@ const procs = {
   TOPMAR01,
   WRECKS05,
 };
+
+/** Get the pivot offset for a symbol, cast to the tuple type MapLibre expects. */
+function symbolOffset(name: string): [number, number] {
+  return (symbols[name]?.offset ?? [0, 0]) as [number, number];
+}
+
+/**
+ * Standard icon layout properties for a symbol used in a CSP.
+ *
+ * Looks up the symbol's pivot offset from the sprite metadata so the icon
+ * renders at the correct position relative to the feature point — matching
+ * what `SY()` does for lookup-table-driven symbols.
+ *
+ * Accepts a static symbol name, a `["case", ...]`, or `["match", ...]`
+ * expression for data-driven icon selection. Builds a parallel offset
+ * expression that mirrors each branch.
+ */
+function iconLayout(
+  image: string | ExpressionSpecification,
+): Record<string, unknown> {
+  if (typeof image === "string") {
+    return {
+      "icon-image": image,
+      "icon-offset": symbolOffset(image),
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true,
+    };
+  }
+
+  const op = image[0] as string;
+
+  if (op === "case") {
+    // ["case", cond1, name1, cond2, name2, ..., default]
+    const [, ...branches] = image;
+    const offsetBranches: unknown[] = [];
+    for (let i = 0; i < branches.length - 1; i += 2) {
+      offsetBranches.push(branches[i]); // condition
+      offsetBranches.push(["literal", symbolOffset(branches[i + 1] as string)]);
+    }
+    offsetBranches.push([
+      "literal",
+      symbolOffset(branches[branches.length - 1] as string),
+    ]);
+
+    return {
+      "icon-image": image,
+      "icon-offset": ["case", ...offsetBranches] as ExpressionSpecification,
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true,
+    };
+  }
+
+  if (op === "match") {
+    // ["match", input, val1, name1, val2, name2, ..., default]
+    const [, input, ...branches] = image;
+    const offsetBranches: unknown[] = [];
+    for (let i = 0; i < branches.length - 1; i += 2) {
+      offsetBranches.push(branches[i]); // match value
+      offsetBranches.push(["literal", symbolOffset(branches[i + 1] as string)]);
+    }
+    offsetBranches.push([
+      "literal",
+      symbolOffset(branches[branches.length - 1] as string),
+    ]);
+
+    return {
+      "icon-image": image,
+      "icon-offset": [
+        "match",
+        input,
+        ...offsetBranches,
+      ] as ExpressionSpecification,
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true,
+    };
+  }
+
+  // Fallback: unknown expression type, no offset
+  return {
+    "icon-image": image,
+    "icon-allow-overlap": true,
+    "icon-ignore-placement": true,
+  };
+}
 
 export function CS(config: LayerConfig, ref: Reference) {
   if (ref.name in procs) {
@@ -60,10 +149,16 @@ export function DEPCNT03(config: LayerConfig): Partial<LayerSpecification>[] {
   // MapLibre doesn't support data expressions in `line-dasharray`, so split into two layers with filters.
   const lowQuality = quaposLowQuality();
   const depcn = colour(config.mode, "DEPCN");
+  const isSafetyContour: ExpressionFilterSpecification = [
+    "all",
+    ["has", "VALDCO"],
+    ["==", ["get", "VALDCO"], config.safetyContour],
+  ];
   return [
+    // Normal depth contours (non-safety)
     {
       type: "line",
-      filter: lowQuality,
+      filter: ["all", lowQuality, ["!", isSafetyContour]],
       paint: {
         "line-dasharray": LineStyles.DASH,
         "line-width": 1,
@@ -72,12 +167,33 @@ export function DEPCNT03(config: LayerConfig): Partial<LayerSpecification>[] {
     },
     {
       type: "line",
-      filter: ["!", lowQuality],
+      filter: ["all", ["!", lowQuality], ["!", isSafetyContour]],
       paint: {
         "line-width": 1,
         "line-color": depcn,
       },
     },
+
+    // Safety contour: LS(SOLD,3,DEPSC) per S-52 10.5.11, Display Base priority 8
+    {
+      type: "line",
+      filter: ["all", isSafetyContour, ["!", lowQuality]],
+      paint: {
+        "line-width": 3,
+        "line-color": colour(config.mode, "DEPSC"),
+      },
+    },
+    // Safety contour with low quality position → dashed
+    {
+      type: "line",
+      filter: ["all", isSafetyContour, lowQuality],
+      paint: {
+        "line-dasharray": LineStyles.DASH,
+        "line-width": 3,
+        "line-color": colour(config.mode, "DEPSC"),
+      },
+    },
+
     {
       type: "symbol",
     },
@@ -103,18 +219,23 @@ export function DEPCNT03(config: LayerConfig): Partial<LayerSpecification>[] {
  *   - Light description text (LITDSN02): CATLIT prefix + LITCHR + SIGGRP +
  *     COLOUR + SIGPER + HEIGHT + VALNMR + STATUS suffix
  *
- * TODO: Sector light arcs and leg lines (requires rendering arcs, which
- *       MapLibre doesn't support natively — may need pipeline pre-computation)
+ * Sector arcs and leg lines are pre-computed as LineString geometries in the
+ * pipeline (bin/generate-sector-arcs) and stored in the _LIGHTS_SECTORS tile
+ * layer. This CSP emits MapLibre line layers referencing that synthetic layer.
+ *
+ * Co-located light detection is pre-computed in the pipeline:
+ *   - _EXTENDED_ARC: sector lights with overlapping sectors use 25mm arc radius
+ *   - _COLOCATED: non-sector lights at the same position offset flare angles
+ *
  * TODO: Major light circles (VALNMR >= 10)
- * TODO: Co-located light detection for flare angle offset
  */
 export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
   // Colour → flare symbol mapping (S-52 spec table)
   // COLOUR is a list attribute stored as a comma-separated string
   const flareSymbol: ExpressionSpecification = [
     "case",
-    // Red or white+red → LIGHTS11 (red flare)
-    ["any", listIncludes("COLOUR", "3"), listIncludes("COLOUR", "3")],
+    // Red (includes white+red, since red takes priority) → LIGHTS11 (red flare)
+    listIncludes("COLOUR", "3"),
     "LIGHTS11",
     // Green or white+green → LIGHTS12 (green flare)
     listIncludes("COLOUR", "4"),
@@ -131,6 +252,8 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
     "LITDEF11",
   ];
 
+  const flareLayout = iconLayout(flareSymbol);
+
   return [
     // --- Special light types (checked first, exit early per spec) ---
 
@@ -142,7 +265,7 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
         ["has", "CATLIT"],
         ["any", listIncludes("CATLIT", "8"), listIncludes("CATLIT", "11")],
       ] as ExpressionFilterSpecification,
-      layout: { "icon-image": "LIGHTS82", "icon-allow-overlap": true },
+      layout: iconLayout("LIGHTS82"),
     },
 
     // Strip light (CATLIT 9)
@@ -155,7 +278,7 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
         ["!", listIncludes("CATLIT", "8")],
         ["!", listIncludes("CATLIT", "11")],
       ] as ExpressionFilterSpecification,
-      layout: { "icon-image": "LIGHTS81", "icon-allow-overlap": true },
+      layout: iconLayout("LIGHTS81"),
     },
 
     // --- Directional lights (CATLIT 1 or 16) with ORIENT ---
@@ -172,16 +295,48 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
         ["!", listIncludes("CATLIT", "11")],
       ] as ExpressionFilterSpecification,
       layout: {
-        "icon-image": flareSymbol,
+        ...flareLayout,
         // ORIENT is from seaward, rotate flare to show direction of light
         "icon-rotate": ["+", ["get", "ORIENT"], 180],
-        "icon-allow-overlap": true,
       },
     },
 
+    // Directional light bearing text: "nnn deg"
+    {
+      type: "symbol",
+      filter: [
+        "all",
+        ["has", "CATLIT"],
+        ["any", listIncludes("CATLIT", "1"), listIncludes("CATLIT", "16")],
+        ["has", "ORIENT"],
+        ["!", listIncludes("CATLIT", "8")],
+        ["!", listIncludes("CATLIT", "9")],
+        ["!", listIncludes("CATLIT", "11")],
+      ] as ExpressionFilterSpecification,
+      layout: {
+        "text-field": [
+          "concat",
+          ["number-format", ["get", "ORIENT"], { "max-fraction-digits": 1 }],
+          " deg",
+        ] as unknown as ExpressionSpecification,
+        "text-font": ["Metropolis Regular"],
+        "text-size": 10,
+        "text-offset": [0, -1.5],
+        "text-anchor": "bottom",
+        "text-allow-overlap": false,
+      },
+      paint: {
+        "text-color": colour(config.mode, "CHBLK"),
+        "text-halo-color": colour(config.mode, "NODTA"),
+        "text-halo-width": 1,
+      },
+      metadata: { "s52:display": "23" },
+    },
+
     // --- Non-sector, non-special lights → flare symbol ---
-    // Sector lights (SECTR1 and SECTR2 present and different) are excluded
-    // since we don't render arcs yet
+    // When co-located with other non-sector lights (_COLOCATED=1), the flare
+    // angle is offset: white/yellow/orange → 45°, red/green/other → 135°.
+    // This separates overlapping flare symbols visually.
     {
       type: "symbol",
       filter: [
@@ -203,13 +358,27 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
         ["any", ["!", ["has", "SECTR1"]], ["!", ["has", "SECTR2"]]],
       ] as ExpressionFilterSpecification,
       layout: {
-        "icon-image": flareSymbol,
-        "icon-allow-overlap": true,
+        ...flareLayout,
+        "icon-rotate": [
+          "case",
+          // Not co-located → default orientation (no rotation)
+          ["!=", ["get", "_COLOCATED"], 1],
+          0,
+          // Co-located: white(1), yellow(6), orange(11) → 45°
+          [
+            "any",
+            listIncludes("COLOUR", "1"),
+            listIncludes("COLOUR", "6"),
+            listIncludes("COLOUR", "11"),
+          ],
+          45,
+          // Co-located: red, green, other → 135°
+          135,
+        ] as ExpressionSpecification,
       },
     },
 
-    // --- Sector lights: just show flare for now ---
-    // TODO: render sector arcs and leg lines
+    // --- Sector lights: flare symbol for each sector ---
     {
       type: "symbol",
       filter: [
@@ -230,14 +399,112 @@ export function LIGHTS06(config: LayerConfig): Partial<LayerSpecification>[] {
           ],
         ],
       ] as ExpressionFilterSpecification,
-      layout: {
-        "icon-image": flareSymbol,
-        "icon-allow-overlap": true,
-      },
+      layout: flareLayout,
     },
+
+    // --- Sector arcs and leg lines (from _LIGHTS_SECTORS synthetic layer) ---
+    // Arc OUTLW underlay: solid 4-wide outline behind the coloured arc
+    ...sectorArcLayers(config),
 
     // --- Light description text (LITDSN02) ---
     ...LITDSN02(config),
+  ];
+}
+
+/**
+ * Sector arc and leg line layers from the pre-computed _LIGHTS_SECTORS layer.
+ *
+ * The pipeline (bin/generate-sector-arcs) produces LineString features with:
+ *   _type: "arc" | "leg"
+ *   _colour: S-52 colour token (LITRD, LITGN, LITYW, CHMGD)
+ *   _style: "SOLD" | "DASH"
+ *   _width: line width (1 or 2)
+ *
+ * Per S-52, arcs are drawn as two layers: a 4-wide OUTLW underlay for contrast,
+ * then the coloured arc on top. Obscured/faint lights (LITVIS 3,7,8) use a
+ * 1-wide dashed CHBLK line instead of the two-layer approach.
+ *
+ * Leg lines are always LS(DASH,1,CHBLK).
+ */
+function sectorArcLayers(config: LayerConfig): Partial<LayerSpecification>[] {
+  const { mode } = config;
+
+  // Map _colour attribute to actual colour values for data-driven styling
+  const arcColour: ExpressionSpecification = [
+    "match",
+    ["get", "_colour"],
+    "LITRD",
+    colour(mode, "LITRD"),
+    "LITGN",
+    colour(mode, "LITGN"),
+    "LITYW",
+    colour(mode, "LITYW"),
+    colour(mode, "CHMGD"),
+  ];
+
+  const scale = scaleFilter();
+
+  return [
+    // Arc OUTLW underlay (solid arcs only — obscured arcs skip the underlay)
+    {
+      type: "line",
+      "source-layer": "_LIGHTS_SECTORS",
+      filter: [
+        "all",
+        scale,
+        ["==", ["get", "_type"], "arc"],
+        ["==", ["get", "_style"], "SOLD"],
+      ],
+      paint: {
+        "line-color": colour(mode, "OUTLW"),
+        "line-width": 4,
+      },
+    } as Partial<LayerSpecification>,
+
+    // Coloured arc (solid, 2-wide)
+    {
+      type: "line",
+      "source-layer": "_LIGHTS_SECTORS",
+      filter: [
+        "all",
+        scale,
+        ["==", ["get", "_type"], "arc"],
+        ["==", ["get", "_style"], "SOLD"],
+      ],
+      paint: {
+        "line-color": arcColour,
+        "line-width": 2,
+      },
+    } as Partial<LayerSpecification>,
+
+    // Obscured/faint arc (dashed, 1-wide, CHBLK)
+    {
+      type: "line",
+      "source-layer": "_LIGHTS_SECTORS",
+      filter: [
+        "all",
+        scale,
+        ["==", ["get", "_type"], "arc"],
+        ["==", ["get", "_style"], "DASH"],
+      ],
+      paint: {
+        "line-color": colour(mode, "CHBLK"),
+        "line-width": 1,
+        "line-dasharray": LineStyles.DASH,
+      },
+    } as Partial<LayerSpecification>,
+
+    // Leg lines (always dashed CHBLK)
+    {
+      type: "line",
+      "source-layer": "_LIGHTS_SECTORS",
+      filter: ["all", scale, ["==", ["get", "_type"], "leg"]],
+      paint: {
+        "line-color": colour(mode, "CHBLK"),
+        "line-width": 1,
+        "line-dasharray": LineStyles.DASH,
+      },
+    } as Partial<LayerSpecification>,
   ];
 }
 
@@ -463,7 +730,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: ["all", ["==", ["geometry-type"], "Point"], isDanger],
-      layout: { "icon-image": "ISODGR01", "icon-allow-overlap": true },
+      layout: iconLayout("ISODGR01"),
     },
 
     // Not isolated danger, no VALSOU, UWTROC class
@@ -483,7 +750,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
         ["==", ["get", "CATOBS"], 6],
         ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
       ],
-      layout: { "icon-image": "OBSTRN11", "icon-allow-overlap": true },
+      layout: iconLayout("OBSTRN11"),
     },
     {
       type: "symbol",
@@ -495,7 +762,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
         ["==", ["get", "CATOBS"], 6],
         ["in", ["get", "WATLEV"], ["literal", [4, 5]]],
       ],
-      layout: { "icon-image": "OBSTRN03", "icon-allow-overlap": true },
+      layout: iconLayout("OBSTRN03"),
     },
 
     // Has VALSOU, not isolated danger, not CATOBS 6, VALSOU <= safetyDepth → DANGER01
@@ -509,7 +776,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
         ["!=", ["get", "CATOBS"], 6],
         ["<=", ["get", "VALSOU"], safetyDepth],
       ],
-      layout: { "icon-image": "DANGER01", "icon-allow-overlap": true },
+      layout: iconLayout("DANGER01"),
     },
 
     // Has VALSOU, not isolated danger, not CATOBS 6, VALSOU > safetyDepth → DANGER02
@@ -523,7 +790,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
         ["!=", ["get", "CATOBS"], 6],
         [">", ["get", "VALSOU"], safetyDepth],
       ],
-      layout: { "icon-image": "DANGER02", "icon-allow-overlap": true },
+      layout: iconLayout("DANGER02"),
     },
 
     // Sounding text on point obstructions with VALSOU (SNDFRM04)
@@ -543,23 +810,20 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
         notDanger,
         ["!", ["has", "VALSOU"]],
       ],
-      layout: {
-        "icon-image": [
-          "case",
-          // CATOBS 6 (foul area) → OBSTRN01
-          ["==", ["get", "CATOBS"], 6],
-          "OBSTRN01",
-          // WATLEV 1,2 (dry/partly submerged) → OBSTRN11
-          ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
-          "OBSTRN11",
-          // WATLEV 4,5 (covers/uncovers, awash) → UWTROC04
-          ["in", ["get", "WATLEV"], ["literal", [4, 5]]],
-          "UWTROC04",
-          // Default → DANGER01
-          "DANGER01",
-        ] as ExpressionSpecification,
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout([
+        "case",
+        // CATOBS 6 (foul area) → OBSTRN01
+        ["==", ["get", "CATOBS"], 6],
+        "OBSTRN01",
+        // WATLEV 1,2 (dry/partly submerged) → OBSTRN11
+        ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
+        "OBSTRN11",
+        // WATLEV 4,5 (covers/uncovers, awash) → UWTROC04
+        ["in", ["get", "WATLEV"], ["literal", [4, 5]]],
+        "UWTROC04",
+        // Default → DANGER01
+        "DANGER01",
+      ] as ExpressionSpecification),
     },
 
     // ─── Line obstructions (Continuation B) ───
@@ -578,8 +842,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
       type: "symbol",
       filter: ["all", ["==", ["geometry-type"], "LineString"], isDanger],
       layout: {
-        "icon-image": "ISODGR01",
-        "icon-allow-overlap": true,
+        ...iconLayout("ISODGR01"),
         "symbol-placement": "line",
       },
     },
@@ -646,7 +909,7 @@ export function OBSTRN07(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: ["all", ["==", ["geometry-type"], "Polygon"], isDanger],
-      layout: { "icon-image": "ISODGR01", "icon-allow-overlap": true },
+      layout: iconLayout("ISODGR01"),
     },
 
     // Not isolated danger, has VALSOU, shallow → dotted CHBLK outline
@@ -888,10 +1151,7 @@ export function QUAPNT02(_config: LayerConfig): Partial<LayerSpecification>[] {
         ],
         quaposLowQuality(),
       ] as ExpressionFilterSpecification,
-      layout: {
-        "icon-image": "LOWACC01",
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout("LOWACC01"),
     },
   ];
 }
@@ -946,34 +1206,29 @@ function restrictionSymbol(
 ): Partial<LayerSpecification>[] {
   const { mode } = config;
 
+  const is61: ExpressionFilterSpecification = [
+    "any",
+    listIncludes("RESTRN", ...additionalRestrn),
+    ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_MILITARY)],
+  ];
+  const is71: ExpressionFilterSpecification = [
+    "any",
+    listIncludes("RESTRN", ...RESTRN_OTHER),
+    ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_NATURE)],
+  ];
+
   return [
     // Symbol in center of area
     {
       type: "symbol",
-      layout: {
-        "icon-image": [
-          "case",
-          // Has additional navigational restrictions → 61
-          listIncludes("RESTRN", ...additionalRestrn),
-          `${prefix}61`,
-          // Has CATREA military/safety values → 61
-          [
-            "all",
-            ["has", "CATREA"],
-            listIncludes("CATREA", ...CATREA_MILITARY),
-          ],
-          `${prefix}61`,
-          // Has other RESTRN values (9-22) → 71
-          listIncludes("RESTRN", ...RESTRN_OTHER),
-          `${prefix}71`,
-          // Has CATREA nature values → 71
-          ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_NATURE)],
-          `${prefix}71`,
-          // Default → 51
-          `${prefix}51`,
-        ] as ExpressionSpecification,
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout([
+        "case",
+        is61,
+        `${prefix}61`,
+        is71,
+        `${prefix}71`,
+        `${prefix}51`,
+      ] as ExpressionSpecification),
     },
 
     // Boundary: plain boundaries use LS(DASH,2,CHMGD)
@@ -1088,7 +1343,7 @@ export function RESARE04(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: filterOther,
-      layout: { "icon-image": "INFARE51", "icon-allow-overlap": true },
+      layout: iconLayout("INFARE51"),
     },
     {
       type: "line",
@@ -1104,21 +1359,14 @@ export function RESARE04(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: filterNoRestrn,
-      layout: {
-        "icon-image": [
-          "case",
-          [
-            "all",
-            ["has", "CATREA"],
-            listIncludes("CATREA", ...CATREA_MILITARY),
-          ],
-          "CTYARE51",
-          ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_NATURE)],
-          "INFARE51",
-          "RSRDEF51",
-        ] as ExpressionSpecification,
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout([
+        "case",
+        ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_MILITARY)],
+        "CTYARE51",
+        ["all", ["has", "CATREA"], listIncludes("CATREA", ...CATREA_NATURE)],
+        "INFARE51",
+        "RSRDEF51",
+      ] as ExpressionSpecification),
     },
     {
       type: "line",
@@ -1150,9 +1398,7 @@ export function RESTRN01(config: LayerConfig): Partial<LayerSpecification>[] {
  * Same priority cascade as RESARE04 but without CATREA checks,
  * since these object classes don't have CATREA.
  */
-export function RESCSP02(config: LayerConfig): Partial<LayerSpecification>[] {
-  const { mode } = config;
-
+export function RESCSP02(_config: LayerConfig): Partial<LayerSpecification>[] {
   const hasRestrn: ExpressionFilterSpecification = ["has", "RESTRN"];
   const hasEntry = listIncludes("RESTRN", ...RESTRN_ENTRY);
   const hasAnchor = listIncludes("RESTRN", ...RESTRN_ANCHOR);
@@ -1194,36 +1440,27 @@ export function RESCSP02(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: fEntry,
-      layout: { "icon-image": "ENTRES51", "icon-allow-overlap": true },
+      layout: iconLayout("ENTRES51"),
     },
     {
       type: "symbol",
       filter: fAnchor,
-      layout: { "icon-image": "ACHRES51", "icon-allow-overlap": true },
+      layout: iconLayout("ACHRES51"),
     },
     {
       type: "symbol",
       filter: fFishing,
-      layout: { "icon-image": "FSHRES51", "icon-allow-overlap": true },
+      layout: iconLayout("FSHRES51"),
     },
     {
       type: "symbol",
       filter: fOwnShip,
-      layout: { "icon-image": "CTYARE51", "icon-allow-overlap": true },
+      layout: iconLayout("CTYARE51"),
     },
     {
       type: "symbol",
       filter: fOther,
-      layout: { "icon-image": "INFARE51", "icon-allow-overlap": true },
-    },
-    {
-      type: "line",
-      filter: hasRestrn,
-      paint: {
-        "line-dasharray": LineStyles.DASH,
-        "line-width": 2,
-        "line-color": colour(mode, "CHMGD"),
-      },
+      layout: iconLayout("INFARE51"),
     },
   ];
 }
@@ -1358,7 +1595,7 @@ export function SLCONS04(config: LayerConfig): Partial<LayerSpecification>[] {
       },
     },
 
-    // Default → solid CSTLN
+    // WATLEV 1 (partly submerged) or 2 (always dry) or absent → solid CSTLN
     {
       type: "line",
       filter: [
@@ -1607,31 +1844,23 @@ export function TOPMAR01(_config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: ["!", ["has", "TOPSHP"]],
-      layout: { "icon-image": "QUESMRK1", "icon-allow-overlap": true },
+      layout: iconLayout("QUESMRK1"),
     },
     // Floating platform (buoy, light float, light vessel) → TOPSHP_FLOATING
     {
       type: "symbol",
       filter: ["all", ["has", "TOPSHP"], ["==", ["get", "_FLOATING"], 1]],
-      layout: {
-        "icon-image": topshpMatch(
-          TOPSHP_FLOATING,
-          "TMARDEF2",
-        ) as ExpressionSpecification,
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout(
+        topshpMatch(TOPSHP_FLOATING, "TMARDEF2") as ExpressionSpecification,
+      ),
     },
     // Rigid platform (beacon, daymark, etc.) → TOPSHP_RIGID
     {
       type: "symbol",
       filter: ["all", ["has", "TOPSHP"], ["!=", ["get", "_FLOATING"], 1]],
-      layout: {
-        "icon-image": topshpMatch(
-          TOPSHP_RIGID,
-          "TMARDEF1",
-        ) as ExpressionSpecification,
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout(
+        topshpMatch(TOPSHP_RIGID, "TMARDEF1") as ExpressionSpecification,
+      ),
     },
   ];
 }
@@ -1659,10 +1888,7 @@ export function UDWHAZ05(
   return {
     type: "symbol",
     filter: isolatedDanger(config),
-    layout: {
-      "icon-image": "ISODGR01",
-      "icon-allow-overlap": true,
-    },
+    layout: iconLayout("ISODGR01"),
   };
 }
 
@@ -1727,10 +1953,7 @@ export function WRECKS05(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: ["all", ["==", ["geometry-type"], "Point"], isDanger],
-      layout: {
-        "icon-image": "ISODGR01",
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout("ISODGR01"),
     },
 
     // Has sounding, shallow (not isolated danger) → DANGER01
@@ -1743,10 +1966,7 @@ export function WRECKS05(config: LayerConfig): Partial<LayerSpecification>[] {
         ["has", "VALSOU"],
         ["<=", ["get", "VALSOU"], safetyDepth],
       ],
-      layout: {
-        "icon-image": "DANGER01",
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout("DANGER01"),
     },
 
     // Has sounding, deep (not isolated danger) → DANGER02
@@ -1759,10 +1979,7 @@ export function WRECKS05(config: LayerConfig): Partial<LayerSpecification>[] {
         ["has", "VALSOU"],
         [">", ["get", "VALSOU"], safetyDepth],
       ],
-      layout: {
-        "icon-image": "DANGER02",
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout("DANGER02"),
     },
 
     // Sounding text on top of DANGER symbols (SNDFRM04)
@@ -1781,29 +1998,26 @@ export function WRECKS05(config: LayerConfig): Partial<LayerSpecification>[] {
         ["==", ["geometry-type"], "Point"],
         ["!", ["has", "VALSOU"]],
       ],
-      layout: {
-        "icon-image": [
-          "case",
-          // WATLEV 1 (partly submerged) or 2 (always dry) → visible wreck
-          ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
-          "WRECKS01",
-          // WATLEV 4 (covers/uncovers) → drying wreck
-          ["==", ["get", "WATLEV"], 4],
-          "WRECKS01",
-          // CATWRK 1 (non-dangerous) + WATLEV 3 (always underwater)
-          ["all", ["==", ["get", "CATWRK"], 1], ["==", ["get", "WATLEV"], 3]],
-          "WRECKS04",
-          // CATWRK 2 (dangerous) + WATLEV 3
-          ["all", ["==", ["get", "CATWRK"], 2], ["==", ["get", "WATLEV"], 3]],
-          "WRECKS05",
-          // CATWRK 4 or 5 (showing mast/funnel)
-          ["in", ["get", "CATWRK"], ["literal", [4, 5]]],
-          "WRECKS01",
-          // Default
-          "WRECKS05",
-        ] as ExpressionSpecification,
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout([
+        "case",
+        // WATLEV 1 (partly submerged) or 2 (always dry) → visible wreck
+        ["in", ["get", "WATLEV"], ["literal", [1, 2]]],
+        "WRECKS01",
+        // WATLEV 4 (covers/uncovers) → drying wreck
+        ["==", ["get", "WATLEV"], 4],
+        "WRECKS01",
+        // CATWRK 1 (non-dangerous) + WATLEV 3 (always underwater)
+        ["all", ["==", ["get", "CATWRK"], 1], ["==", ["get", "WATLEV"], 3]],
+        "WRECKS04",
+        // CATWRK 2 (dangerous) + WATLEV 3
+        ["all", ["==", ["get", "CATWRK"], 2], ["==", ["get", "WATLEV"], 3]],
+        "WRECKS05",
+        // CATWRK 4 or 5 (showing mast/funnel)
+        ["in", ["get", "CATWRK"], ["literal", [4, 5]]],
+        "WRECKS01",
+        // Default
+        "WRECKS05",
+      ] as ExpressionSpecification),
     },
 
     // --- Area wrecks ---
@@ -1917,10 +2131,7 @@ export function WRECKS05(config: LayerConfig): Partial<LayerSpecification>[] {
     {
       type: "symbol",
       filter: ["all", ["==", ["geometry-type"], "Polygon"], isDanger],
-      layout: {
-        "icon-image": "ISODGR01",
-        "icon-allow-overlap": true,
-      },
+      layout: iconLayout("ISODGR01"),
     },
   ];
 }

@@ -139,26 +139,40 @@ export function lookupToLayers(
   return instructionsToStyles(lookup.inst, config).map((layer, index) => {
     const visibility = layerVisibility(lookup, layer, config);
 
+    // CSP layers can set source-layer to reference synthetic tile layers
+    // (e.g. _LIGHTS_SECTORS). When present, skip the lookup-derived filter
+    // since the synthetic layer has its own schema.
+    const sourceLayer =
+      (layer as LayerSpecification)["source-layer"] ?? lookup.obcl;
+    const isSyntheticLayer = sourceLayer !== lookup.obcl;
+
     return {
       ...layer,
       metadata: {
         s52: lookup,
       },
-      filter: filters.all(
-        filters.scaleFilter(),
-        filterGeometryType[lookup.ftyp],
-        ...filters.attributeFilters(lookup.attc),
-        ...("filter" in layer
-          ? [layer.filter as ExpressionFilterSpecification]
-          : []),
-      ),
+      ...(isSyntheticLayer
+        ? {
+            filter: (layer as Record<string, unknown>)
+              .filter as FilterSpecification,
+          }
+        : {
+            filter: filters.all(
+              filters.scaleFilter(),
+              filterGeometryType[lookup.ftyp],
+              ...filters.attributeFilters(lookup.attc),
+              ...("filter" in layer
+                ? [layer.filter as ExpressionFilterSpecification]
+                : []),
+            ),
+          }),
       layout: {
         ...layer.layout,
         [`${layer.type}-sort-key`]: sortKey(lookup.dpri, layer),
         ...(visibility === "none" ? { visibility } : {}),
       },
       source: "enc",
-      "source-layer": lookup.obcl,
+      "source-layer": sourceLayer,
       id: `${baseId}-${index}`,
     };
   });
