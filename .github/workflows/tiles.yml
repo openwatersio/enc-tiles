@@ -1,0 +1,59 @@
+name: Tiles
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+# Allow one concurrent build, but don't cancel an in-progress run.
+concurrency:
+  group: tiles
+  cancel-in-progress: false
+
+env:
+  TIPPECANOE_VERSION: 2.79.0
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gdal-bin
+
+      # The Makefile calls tile-join directly; provide it as a shim around the
+      # tippecanoe Docker image, with the working directory mounted at /data.
+      - name: Install tile-join (tippecanoe)
+        run: |
+          docker pull "ghcr.io/openwatersio/tippecanoe:${TIPPECANOE_VERSION}"
+          sudo tee /usr/local/bin/tile-join >/dev/null <<EOF
+          #!/usr/bin/env bash
+          exec docker run --rm -v "\$PWD:/data" --ulimit nofile=100000:100000 \
+            "ghcr.io/openwatersio/tippecanoe:${TIPPECANOE_VERSION}" tile-join "\$@"
+          EOF
+          sudo chmod +x /usr/local/bin/tile-join
+
+      - name: Downloading data
+        run: make data
+
+      - name: Build tiles
+        run: make -j$(nproc)
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_DEFAULT_REGION: auto
+          # R2 does not support the CRC checksums the AWS CLI sends by default.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: aws s3 cp tiles/noaa.pmtiles "s3://${R2_BUCKET}/noaa.pmtiles"
