@@ -26,7 +26,7 @@ protocol.add(pmtiles);
 const header = await pmtiles.getHeader();
 
 const style = createStyle({
-  sprite: `${window.location.origin}/sprites`,
+  sprite: `${window.location.origin}${import.meta.env.BASE_URL}sprites`,
   source: {
     type: "vector",
     url: `pmtiles://${url}`,
