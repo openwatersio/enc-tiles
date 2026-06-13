@@ -22,12 +22,16 @@ VERBOSE=${VERBOSE:-0}
 [ "$VERBOSE" = "1" ] && set -x
 
 if [ $# -lt 2 ]; then
-  echo "Usage: $0 input.000 output.pmtiles"
+  echo "Usage: $0 input.000 output.pmtiles [--coverage coverage.gpkg]"
   exit 1
 fi
 
 input="$1"
 output="$2"
+coverage=""
+if [ "${3:-}" = "--coverage" ] && [ -n "${4:-}" ]; then
+  coverage="$4"
+fi
 
 export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON,LIST_AS_STRING=ON"
 
@@ -40,14 +44,16 @@ if [ -z "$intu" ]; then
   exit 1
 fi
 
-# INTU → zoom range
+# INTU → zoom range. Each chart generates tiles only at its native zoom levels.
+# tile-join --overzoom fills in higher zooms by scaling parent tiles where no
+# higher-INTU chart exists, so features don't disappear when zooming in.
 case "$intu" in
-  1) minzoom=0;  maxzoom=6  ;;
-  2) minzoom=7;  maxzoom=8  ;;
-  3) minzoom=9;  maxzoom=10 ;;
-  4) minzoom=11; maxzoom=12 ;;
-  5) minzoom=13; maxzoom=14 ;;
-  6) minzoom=15; maxzoom=16 ;;
+  1) minzoom=0; maxzoom=4  ;;
+  2) minzoom=0; maxzoom=6  ;;
+  3) minzoom=0; maxzoom=8 ;;
+  4) minzoom=0; maxzoom=10 ;;
+  5) minzoom=0; maxzoom=11 ;;
+  6) minzoom=0; maxzoom=12 ;;
   *) echo "Unknown INTU: $intu"; exit 1 ;;
 esac
 
@@ -66,6 +72,14 @@ ogr2ogr -f GPKG "$gpkg" "$input" -skipfailures 2>/dev/null
 
 # List available feature tables
 tables=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}')
+
+# Add INTU (intended use / navigational purpose) to every feature so the style
+# can implement quilting: preferring higher-INTU features when charts overlap.
+for table in $tables; do
+  [ "$table" = "DSID" ] && continue
+  ogrinfo --quiet "$gpkg" -dialect sqlite \
+    -sql "ALTER TABLE \"${table}\" ADD COLUMN INTU INTEGER DEFAULT ${intu}"
+done
 
 # UDWHAZ05: Store the DRVAL1 of the containing DEPARE on WRECKS and OBSTRN.
 # The style uses this at render time to evaluate isolated danger status
@@ -149,8 +163,67 @@ if echo "$tables" | grep -q '^LIGHTS$'; then
       )"
 fi
 
+# Step 2b: Quilting — clip features against higher-INTU chart coverage.
+# Where a more detailed chart exists, remove this chart's features so they
+# don't bleed through (coarse coastlines obscuring detailed harbour water, etc).
+if [ -n "$coverage" ] && [ -f "$coverage" ]; then
+  # Import higher-INTU M_COVR polygons into the chart GPKG via GeoJSON
+  # (direct GPKG-to-GPKG append can have geometry column name conflicts)
+  cov_geojson="$tmpdir/quilting_coverage.geojson"
+  ogr2ogr -f GeoJSON "$cov_geojson" "$coverage" coverage \
+    -where "INTU > ${intu}" -select "INTU" 2>/dev/null
+
+  if [ -s "$cov_geojson" ]; then
+    ogr2ogr -f GPKG "$gpkg" "$cov_geojson" -append -nln quilting 2>/dev/null
+
+    # Pre-compute the union of all higher-INTU coverage into a single mask
+    ogrinfo --quiet "$gpkg" -dialect sqlite -sql \
+      "CREATE TABLE quilt_mask AS SELECT ST_Union(geom) as geom FROM quilting"
+
+    has_mask=$(ogrinfo -q "$gpkg" -dialect sqlite \
+      -sql "SELECT COUNT(*) FROM quilt_mask WHERE geom IS NOT NULL" 2>/dev/null \
+      | grep -o '[0-9]*' | tail -1)
+
+    if [ "${has_mask:-0}" -gt 0 ]; then
+      for table in $tables; do
+        [ "$table" = "DSID" ] && continue
+
+        # Detect geometry types present in this table
+        geom_types=$(ogrinfo -q "$gpkg" -dialect sqlite \
+          -sql "SELECT DISTINCT GeometryType(geom) FROM \"${table}\" WHERE geom IS NOT NULL" 2>/dev/null \
+          | grep -oE 'POLYGON|LINESTRING|POINT|MULTI' || true)
+
+        [ -z "$geom_types" ] && continue
+
+        # Clip polygons and lines: trim geometry to exclude masked area
+        if echo "$geom_types" | grep -qE 'POLYGON|LINESTRING'; then
+          ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+            UPDATE \"${table}\" SET geom = ST_Difference(\"${table}\".geom, (SELECT geom FROM quilt_mask))
+            WHERE ST_Intersects(\"${table}\".geom, (SELECT geom FROM quilt_mask))
+              AND GeometryType(\"${table}\".geom) IN ('POLYGON', 'MULTIPOLYGON', 'LINESTRING', 'MULTILINESTRING')
+          " 2>/dev/null || true
+        fi
+
+        # Delete points inside the mask
+        if echo "$geom_types" | grep -q 'POINT'; then
+          ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+            DELETE FROM \"${table}\"
+            WHERE GeometryType(geom) IN ('POINT', 'MULTIPOINT')
+              AND ST_Within(\"${table}\".geom, (SELECT geom FROM quilt_mask))
+          " 2>/dev/null || true
+        fi
+
+        # Clean up empty geometries
+        ogrinfo --quiet "$gpkg" -dialect sqlite -sql "
+          DELETE FROM \"${table}\" WHERE geom IS NULL OR ST_IsEmpty(geom) = 1
+        " 2>/dev/null || true
+      done
+    fi
+  fi
+fi
+
 # Step 3: Export each layer to GeoJSON for import into tippecanoe.
-layers=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}' | grep -v '^DSID$')
+layers=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}' | grep -v '^DSID$' | grep -v '^quilting$' | grep -v '^quilt_mask$')
 
 geojson_files=()
 for layer in $layers; do
@@ -185,6 +258,7 @@ fi
 tippecanoe \
   -o "$output" \
   --force \
+  --use-attribute-for-id=LNAM \
   --no-tile-size-limit \
   --minimum-zoom="$minzoom" \
   --maximum-zoom="$maxzoom" \

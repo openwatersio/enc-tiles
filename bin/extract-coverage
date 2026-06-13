@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Extracts M_COVR (CATCOV=1) polygons from all charts into a single GPKG,
+# tagged with each chart's INTU. Used by s57-to-tiles to clip lower-INTU
+# features where higher-INTU charts provide coverage.
+#
+# Usage: bin/extract-coverage output.gpkg chart1.000 chart2.000 ...
+
+set -e
+
+if [ $# -lt 2 ]; then
+  echo "Usage: $0 output.gpkg chart1.000 [chart2.000 ...]"
+  exit 1
+fi
+
+output="$1"
+shift
+
+export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON,LIST_AS_STRING=ON"
+
+rm -f "$output"
+
+for input in "$@"; do
+  # Extract INTU
+  dsid=$(ogrinfo -q "$input" DSID 2>/dev/null)
+  intu=$(echo "$dsid" | grep DSID_INTU | awk '{print $NF}')
+  [ -z "$intu" ] && continue
+
+  # Check if M_COVR layer exists
+  layers=$(ogrinfo -q "$input" 2>/dev/null | awk '{print $2}')
+  echo "$layers" | grep -q '^M_COVR$' || continue
+
+  # Append M_COVR features with CATCOV=1 to output, adding INTU
+  if [ -f "$output" ]; then
+    ogr2ogr -f GPKG "$output" "$input" M_COVR \
+      -append -nln coverage \
+      -where "CATCOV=1" \
+      -sql "SELECT *, ${intu} AS INTU FROM M_COVR WHERE CATCOV=1" \
+      -skipfailures 2>/dev/null
+  else
+    ogr2ogr -f GPKG "$output" "$input" M_COVR \
+      -nln coverage \
+      -where "CATCOV=1" \
+      -sql "SELECT *, ${intu} AS INTU FROM M_COVR WHERE CATCOV=1" \
+      -skipfailures 2>/dev/null
+  fi
+done
+
+if [ -f "$output" ]; then
+  # Create spatial index for fast lookups during clipping
+  ogrinfo --quiet "$output" -dialect sqlite \
+    -sql "SELECT CreateSpatialIndex('coverage', 'geom')" 2>/dev/null || true
+  count=$(ogrinfo -q "$output" -dialect sqlite \
+    -sql "SELECT COUNT(*) FROM coverage" 2>/dev/null | grep -o '[0-9]*' | tail -1)
+  echo "Extracted $count M_COVR polygons to $output"
+else
+  echo "No M_COVR features found"
+  exit 1
+fi

@@ -153,8 +153,11 @@ export function lookupToLayers(
       },
       ...(isSyntheticLayer
         ? {
-            filter: (layer as Record<string, unknown>)
-              .filter as FilterSpecification,
+            filter: filters.all(
+              ...("filter" in layer
+                ? [layer.filter as ExpressionFilterSpecification]
+                : []),
+            ),
           }
         : {
             filter: filters.all(

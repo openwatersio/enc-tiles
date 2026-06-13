@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+// Parses an S-57 CATALOG.031 file and outputs .000 chart paths that intersect
+// a bounding box. The CATALOG.031 is ISO 8211 binary, but the structure is
+// simple enough to extract with a regex over the latin-1 decoded bytes.
+//
+// Usage:
+//   bin/find-charts <CATALOG.031> --bbox west,south,east,north
+//   bin/find-charts <CATALOG.031> --place "San Francisco Bay"
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { parseArgs } from "node:util";
+
+function parseCatalog(catalogPath) {
+  const buf = readFileSync(catalogPath);
+  // Decode as latin-1 so every byte maps 1:1 to a char
+  const text = buf.toString("latin1");
+
+  // CATD records: CD + 10-digit RCID + filename + fields separated by \x1f
+  // IMPL (3 chars "BIN") is concatenated with SLAT (no separator)
+  const pattern =
+    /CD\d{10}([A-Z0-9]+\\[A-Z0-9]+\.000)\x1f([^\x1f]*)\x1fV01X01\x1fBIN([^\x1f]+)\x1f([^\x1f]+)\x1f([^\x1f]+)\x1f([^\x1f]+)\x1f/g;
+
+  const charts = [];
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const [, file, title, slat, wlon, nlat, elon] = match;
+    charts.push({
+      file: file.replace("\\", "/"),
+      title,
+      slat: parseFloat(slat),
+      wlon: parseFloat(wlon),
+      nlat: parseFloat(nlat),
+      elon: parseFloat(elon),
+    });
+  }
+  return charts;
+}
+
+function intersects(chart, [west, south, east, north]) {
+  return (
+    chart.wlon <= east &&
+    chart.elon >= west &&
+    chart.slat <= north &&
+    chart.nlat >= south
+  );
+}
+
+async function geocode(placeName) {
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", placeName);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "1");
+
+  const res = await fetch(url, {
+    headers: { "User-Agent": "enc-tiles/1.0" },
+  });
+
+  if (!res.ok) {
+    throw new Error(
+      `Nominatim request failed: ${res.status} ${res.statusText}`,
+    );
+  }
+
+  const results = await res.json();
+  if (results.length === 0) {
+    throw new Error(`No results found for "${placeName}"`);
+  }
+
+  const [south, north, west, east] = results[0].boundingbox.map(Number);
+  console.error(`${results[0].display_name}`);
+  console.error(`bbox: ${west},${south},${east},${north}`);
+  return [west, south, east, north];
+}
+
+// --- CLI ---
+
+const { values, positionals } = parseArgs({
+  strict: false,
+  allowPositionals: true,
+  options: {
+    bbox: { type: "string" },
+    place: { type: "string" },
+    help: { type: "boolean", short: "h" },
+  },
+});
+
+if (values.help || positionals.length === 0) {
+  console.error(
+    "Usage: find-charts <CATALOG.031> --bbox west,south,east,north",
+  );
+  console.error('       find-charts <CATALOG.031> --place "San Francisco Bay"');
+  process.exit(values.help ? 0 : 1);
+}
+
+const catalogPath = positionals[0];
+let bbox;
+
+if (values.bbox) {
+  bbox = values.bbox.split(",").map(Number);
+  if (bbox.length !== 4 || bbox.some(isNaN)) {
+    console.error("Invalid bbox: expected west,south,east,north");
+    process.exit(1);
+  }
+} else if (values.place) {
+  bbox = await geocode(values.place);
+} else {
+  console.error("Must specify --bbox or --place");
+  process.exit(1);
+}
+
+const encRoot = dirname(catalogPath);
+const charts = parseCatalog(catalogPath);
+const matching = charts.filter((c) => intersects(c, bbox));
+
+for (const chart of matching) {
+  console.log(join(encRoot, chart.file));
+}
