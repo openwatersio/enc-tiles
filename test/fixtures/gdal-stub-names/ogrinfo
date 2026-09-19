@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Stub GDAL ogrinfo for exercising bin/extract-names' control flow.
+#
+# A THIN LAYER over test/fixtures/gdal-stub/ogrinfo rather than a second stub:
+# everything bin/extract-names reads from a chart -- the layer listing, the
+# DSID dump, the failure shapes -- is already answered there, and two stubs
+# disagreeing about what a chart looks like is worse than none.
+#
+# The one thing the shared stub cannot express is PER-TABLE columns: it answers
+# every pragma_table_info with the same STUB_COLUMNS, and what extract-names
+# has to decide is table by table -- this class has OBJNAM, that one only
+# NOBJNM, so the union needs a NULL of the missing name in the right arm.
+#
+#   STUB_TABLE_COLUMNS  per-table attribute columns, "TABLE=COL COL;TABLE=COL",
+#                       for the tables that need to differ. fid and geom are
+#                       always prepended, exactly as the shared stub prepends
+#                       them, because the caller must exclude them itself. A
+#                       table not named here falls back to STUB_COLUMNS.
+#
+# test/extract-names.test.js copies the shared stub in beside this one as
+# `ogrinfo-gdal`, which is where everything else is sent.
+set -u
+
+args="$*"
+
+case "$args" in
+  *pragma_table_info*)
+    [ -n "${STUB_SQL_LOG:-}" ] && printf '%s\n--\n' "${args#*-sql }" >>"$STUB_SQL_LOG"
+
+    table="${args#*pragma_table_info(}"
+    table="${table#\'}"
+    table="${table%%\'*}"
+
+    columns=""
+    found=0
+    saved_ifs="$IFS"
+    IFS=';'
+    for entry in ${STUB_TABLE_COLUMNS:-}; do
+      case "$entry" in
+        "$table="*)
+          columns="${entry#*=}"
+          found=1
+          ;;
+      esac
+    done
+    IFS="$saved_ifs"
+    [ "$found" = "1" ] || columns="${STUB_COLUMNS:-OBJNAM INTU}"
+
+    i=0
+    for c in fid geom $columns; do
+      echo "OGRFeature(SELECT):$i"
+      echo "  name (String) = $c"
+      i=$((i + 1))
+    done
+    exit 0
+    ;;
+esac
+
+exec "$(dirname "$0")/ogrinfo-gdal" "$@"
