@@ -345,6 +345,73 @@ describe("_TERRAIN", () => {
     });
   });
 
+  test("a placeholder OBJNAM is no name: no anchor, no name floor (Plotroom dev #157)", () => {
+    // The 2026-09-19 dev build carried the literal "<Null>" where the
+    // producer had no name; this script took it for one, pinned the icon to
+    // zoom 0 and emitted an anchor, and the chart printed "<Null> 136 m". The
+    // whole family is refused, trimmed and case-insensitively, so such a
+    // point is UNNAMED: it competes on height like any other and gets no
+    // anchor. A real name beside it still wins the cell and is the only
+    // anchor.
+    const placeholders = [
+      "<Null>",
+      "<null>",
+      "NULL",
+      "null",
+      "Null",
+      "None",
+      "<None>",
+      " <Null> ",
+      "   ",
+    ];
+    for (const placeholder of placeholders) {
+      const { LNDELV, _TERRAIN } = run(
+        {
+          LNDELV: [
+            peak("bogus", { name: placeholder, elevation: 3000 }),
+            peak("real", { name: "Frosty Pk", elevation: 136, lon: 0.0001 }),
+          ],
+        },
+        { maxzoom: 12 },
+      );
+      // The placeholder-named point is unnamed: the NAMED point beside it
+      // holds the shared cell at every contested zoom, so it loses to the
+      // band maxzoom rather than riding a name floor to zoom 0.
+      expect([placeholder, minzooms(LNDELV)["real"]]).toEqual([placeholder, 0]);
+      expect([placeholder, minzooms(LNDELV)["bogus"]]).toEqual([
+        placeholder,
+        12,
+      ]);
+      expect([
+        placeholder,
+        _TERRAIN.features.map((f) => f.properties.OBJNAM),
+      ]).toEqual([placeholder, ["Frosty Pk"]]);
+    }
+    // Alone, it competes as an unnamed point — it still gets its cell at z0,
+    // and still no anchor.
+    const { LNDELV, _TERRAIN } = run(
+      { LNDELV: [peak("only", { name: "<Null>", elevation: 136 })] },
+      { maxzoom: 12 },
+    );
+    expect(minzooms(LNDELV)["only"]).toBe(0);
+    expect(_TERRAIN.features).toEqual([]);
+  });
+
+  test("a placeholder on the losing side of a coincident pair is not unioned onto the representative", () => {
+    // The union carries a REAL name off the SLOGRD twin (Coach Butte above);
+    // a placeholder there names nothing and must not be written onto the
+    // LNDELV point or produce an anchor.
+    const { LNDELV, _TERRAIN } = run(
+      {
+        LNDELV: [peak("spot", { elevation: 148.7 })],
+        SLOGRD: [peak("ground", { name: "<Null>" })],
+      },
+      { maxzoom: 12 },
+    );
+    expect(LNDELV.features[0].properties).not.toHaveProperty("OBJNAM");
+    expect(_TERRAIN.features).toEqual([]);
+  });
+
   test("an anchor is exempt from dot-dropping and carries the interval", () => {
     // ANCHOR_TIPPECANOE, not the thinning stamp: the label may name a summit
     // whose icon arrives later, and bin/stamp-quilt-zooms composes the range

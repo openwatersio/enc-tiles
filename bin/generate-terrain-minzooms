@@ -164,10 +164,27 @@ function mercator(lon, lat) {
   return [x, y];
 }
 
-/** The feature's name, or null. A blank OBJNAM names nothing. */
+// OBJNAM spellings that are a NULL, not a name -- compared trimmed and
+// case-insensitively. Plotroom dev #157: a build carried the literal string
+// "<Null>" where the producer had no name, this script took it for one, and
+// the chart printed "<Null> 136 m" beside every unnamed spot height -- with
+// the point's icon pinned to zoom 0 as if a mariner steered by it. No code in
+// this pipeline spells the string; it is a converter's or a producer's
+// placeholder reaching the export, so the whole family is refused here and a
+// point carrying one is UNNAMED: no _TERRAIN anchor, no name floor, the
+// competed minzoom like any other unnamed point. The frontend style refuses
+// the same family (`namedObjnamClause`) for tiles built before this.
+const NAME_PLACEHOLDERS = new Set(["<null>", "null", "none", "<none>"]);
+
+/** The feature's name, or null. A blank or placeholder OBJNAM names nothing. */
 function nameOf(properties) {
   const name = properties?.OBJNAM;
-  return typeof name === "string" && name.trim() !== "" ? name : null;
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim();
+  if (trimmed === "" || NAME_PLACEHOLDERS.has(trimmed.toLowerCase())) {
+    return null;
+  }
+  return name;
 }
 
 /**
