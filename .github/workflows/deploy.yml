@@ -33,7 +33,7 @@ jobs:
         run: cargo install spreet
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build packages
         run: npm run build
