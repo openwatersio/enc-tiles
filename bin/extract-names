@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# Exports ONE chart's NAMED features as the per-cell half of the chart name
+# index: <outdir>/names.json, exactly the shape plotroom
+# docs/architecture/NAME_INDEX.md section 2 spells out. The chart pipeline
+# reduces one of these per cell into the national shards the browser's
+# "Chart features" search reads.
+#
+# Usage: bin/extract-names <cell.000> <outdir> [--tmpdir DIR]
+#
+#   --tmpdir DIR  where the transient GeoPackage and GeoJSON are built, for a
+#                 caller whose /tmp is smaller than a band-1 cell. Created if
+#                 it does not exist; the run's own scratch directory under it
+#                 is removed on exit either way.
+#
+# A SIBLING of bin/extract-analysis rather than a hook inside bin/s57-to-tiles,
+# for the same reason: the tiler only runs for cells whose tiles are NOT
+# already in the per-cell cache, while the index needs every member cell of a
+# region on every rebuild. The orchestrator runs this for every downloaded cell
+# -- cache hit or not -- and the tile path never executes this program, so tile
+# builds are byte-identical whether the name index is on or off.
+#
+# WHAT IS EXPORTED
+#
+# Every feature table the cell carries that has an OBJNAM or an NOBJNM column
+# and at least one row with a non-empty one. The class list is therefore the
+# CELL's, not a hard-coded roster: "named" is a property of the data, and a
+# roster would have to be revised every time NOAA charts a name on a class
+# nobody listed. Excluded, in one place:
+#
+#   DSID         the dataset header, not a feature class
+#   M_*          the meta classes (coverage, quality, accuracy) -- their
+#                OBJNAM is survey bookkeeping, not a place a user searches for
+#   C_*          the collection objects (aggregations, associations), which
+#                carry no geometry to anchor
+#   $* and _*    GDAL's S-57 "primitive" and update tables, and the derived
+#                layers this repository stamps on itself
+#   SOUNDG       soundings: hundreds of thousands of rows per region, never
+#                named, and nothing a search box should ever have to page
+#
+# THE SHAPE OF THE READ
+#
+# ONE GeoPackage import of the whole cell (the same -skipfailures import
+# bin/s57-to-tiles step 1 makes), then ONE GeoJSON export driven by a single
+# UNION ALL over the included tables. Two invocations of the toolchain per
+# cell, not two per class: the index runs over every cell of the country on
+# every build, and a per-class loop turns a minute into twenty.
+#
+# There is no quilt clip here and no --coverage option, deliberately. The
+# index is a SEARCH FACET, not navigational data: the answer to "Elliott Bay"
+# has to exist whether or not a finer chart happens to cover the bay, and the
+# national reduce already resolves the duplicates a cell overlap produces
+# (NAME_INDEX.md section 3 -- identical LNAM keeps the finest compilation
+# scale, then same name and class within 2 km keeps one). Clipping here would
+# instead DELETE names from the coarse cell that the finer cell may not carry
+# at all. Nothing in this file differences, unions or masks geometry, and
+# nothing in it wraps a geometry expression in a cast.
+#
+# Exit codes:
+#   0  names.json was written. A cell that carries no named class at all is
+#      unremarkable and writes an empty records array; so does a cell whose
+#      named classes hold nothing but names the drop rules reject.
+#   1  bad arguments; a chart ogrinfo cannot read, or one with no layers at
+#      all (a corrupt/truncated .000 must never masquerade as "carries no
+#      name"); or a failed write of names.json or of the intermediate the
+#      records are read from.
+#
+# An unknown or missing INTU is a WARNING, not a refusal -- the one deliberate
+# difference from bin/extract-analysis. The analysis extract must refuse what
+# the tiler refuses because its output is route-safety geometry; a missing
+# usage band costs the index one sort key on one cell, and losing that cell's
+# names to protect a sort key is the worse trade. The record then carries
+# "intu": null.
+
+set -e
+
+VERBOSE=${VERBOSE:-0}
+[ "$VERBOSE" = "1" ] && set -x
+
+if [ $# -lt 2 ]; then
+  echo "Usage: $0 <cell.000> <outdir> [--tmpdir DIR]"
+  exit 1
+fi
+
+input="$1"
+outdir="$2"
+shift 2
+
+tmpdir_root=""
+while [ $# -gt 0 ]; do
+  if [ -z "${2:-}" ]; then
+    echo "Missing value for $1"
+    exit 1
+  fi
+  case "$1" in
+    --tmpdir) tmpdir_root="$2" ;;
+    *)
+      echo "Unknown argument: $1"
+      exit 1
+      ;;
+  esac
+  shift 2
+done
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=bin/quilt-rung.sh
+. "$SCRIPT_DIR/quilt-rung.sh"
+
+# The same driver options every other reader of a .000 in this repository sets,
+# so the index sees the same features the tiles do.
+export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON,LIST_AS_STRING=ON"
+
+mkdir -p "$outdir"
+
+if [ -n "$tmpdir_root" ]; then
+  mkdir -p "$tmpdir_root"
+  tmpdir=$(mktemp -d "$tmpdir_root/extract-names-XXXXXX")
+else
+  tmpdir=$(mktemp -d)
+fi
+trap 'rm -rf "$tmpdir"' EXIT
+
+started=$SECONDS
+
+# UNREADABLE is not NAMELESS: an ogrinfo failure, or a chart with no layers
+# whatsoever, is a corrupt or truncated .000 -- exit 1 loud, never the "carries
+# no named class" exit 0 that a silent hole in the index would hide behind.
+layer_errors="$tmpdir/layers.err"
+if ! layer_listing=$(ogrinfo -q "$input" 2>"$layer_errors"); then
+  echo "$input: ogrinfo could not read the chart" >&2
+  cat "$layer_errors" >&2
+  exit 1
+fi
+layers=$(printf '%s\n' "$layer_listing" | grep "^[0-9]" | awk '{print $2}' || true)
+if [ -z "$layers" ]; then
+  echo "$input: chart has no readable layers (corrupt or truncated download?)" >&2
+  cat "$layer_errors" >&2
+  exit 1
+fi
+
+# The dataset header: the cell's own name, its usage band and its compilation
+# scale, read exactly as bin/s57-to-tiles and bin/quilt-rung.sh read them.
+dsid=$(ogrinfo -q "$input" DSID 2>/dev/null || true)
+
+intu=$(printf '%s\n' "$dsid" | grep DSID_INTU | awk '{print $NF}' || true)
+case "$intu" in
+  1 | 2 | 3 | 4 | 5 | 6) : ;;
+  *)
+    echo "$input: unknown INTU '${intu}'; indexing this cell with a null usage band" >&2
+    intu=""
+    ;;
+esac
+
+# DSPM_CSCL, else the COARSER rung of the band's standard pair, else 0 -- the
+# "0 when unknown" the shard's compilation-scale field is specified to carry.
+cscale=$(quilt_dsid_cscale "$dsid")
+if [ -z "$cscale" ] && [ -n "$intu" ]; then
+  cscale=$(quilt_band_cscale "$intu" || true)
+fi
+[ -z "$cscale" ] && cscale=0
+
+# The cell name records are keyed by, read the way bin/s57-to-tiles reads it
+# for the M_COVR stamp, falling back to the file name: a cell whose DSID
+# carries no usable name is still worth indexing, and the downloaded file is
+# named after the cell.
+cell=$(printf '%s\n' "$dsid" | grep DSID_DSNM | awk '{print $NF}' |
+  sed 's/\.[0-9][0-9][0-9]$//' | grep -xE '[A-Za-z0-9]{8}' || true)
+if [ -z "$cell" ]; then
+  cell=$(basename "$input")
+  cell="${cell%.*}"
+fi
+
+# One whole-cell import, as bin/s57-to-tiles step 1 makes it. -skipfailures for
+# the same reason it does: a single feature the S-57 driver cannot translate
+# must not cost the cell its whole name list, and unlike the analysis extract
+# nothing downstream reads this geometry for safety.
+gpkg="$tmpdir/names.gpkg"
+import_errors="$tmpdir/import.err"
+if ! ogr2ogr -f GPKG "$gpkg" "$input" -skipfailures 2>"$import_errors"; then
+  echo "$input: could not import the chart into a GeoPackage" >&2
+  cat "$import_errors" >&2
+  exit 1
+fi
+
+tables=$(ogrinfo -q "$gpkg" 2>/dev/null | grep "^[0-9]" | awk '{print $2}' || true)
+
+# The attribute columns of one table.
+#
+# pragma_table_info through the SQLite dialect, NOT a parse of ogrinfo's
+# summary -- the same read bin/s57-to-tiles' quilt_columns makes, and for the
+# same reason: the summary is a formatted report whose dressings have already
+# produced silent corruption twice (GDAL 3.13 prints no summary at all under
+# -q, and without -q the "INFO: Open of ..." banner parses as a column named
+# INFO). A GeoPackage is SQLite, so the schema is queryable as data.
+names_columns() {
+  ogrinfo -q "$gpkg" -dialect sqlite \
+    -sql "SELECT name FROM pragma_table_info('$1')" 2>/dev/null |
+    sed -n 's/^ *name (String) = //p'
+}
+
+has_column() {
+  printf '%s\n' "$2" | grep -qx "$1"
+}
+
+# One SELECT per included table, UNION ALL'd into a single export. A table that
+# lacks one of the three attributes selects a NULL of the right name instead,
+# so every arm of the union has the same column list -- which is what makes it
+# a union at all, and what lets the reader treat a missing NOBJNM and an empty
+# one identically.
+sql=""
+class_count=0
+for table in $tables; do
+  case "$table" in
+    DSID | SOUNDG) continue ;;
+    M_* | C_* | \$* | _*) continue ;;
+  esac
+
+  columns=$(names_columns "$table")
+
+  has_objnam=0
+  has_nobjnm=0
+  has_lnam=0
+  has_geom=0
+  if has_column OBJNAM "$columns"; then has_objnam=1; fi
+  if has_column NOBJNM "$columns"; then has_nobjnm=1; fi
+  if has_column LNAM "$columns"; then has_lnam=1; fi
+  if has_column geom "$columns"; then has_geom=1; fi
+
+  # Nothing to name, or nothing to place the name at.
+  if [ "$has_objnam" != "1" ] && [ "$has_nobjnm" != "1" ]; then continue; fi
+  if [ "$has_geom" != "1" ]; then continue; fi
+
+  if [ "$has_objnam" = "1" ]; then
+    objnam_expr="OBJNAM"
+    objnam_filter="(OBJNAM IS NOT NULL AND OBJNAM <> '')"
+  else
+    objnam_expr="NULL AS OBJNAM"
+    objnam_filter=""
+  fi
+  if [ "$has_nobjnm" = "1" ]; then
+    nobjnm_expr="NOBJNM"
+    nobjnm_filter="(NOBJNM IS NOT NULL AND NOBJNM <> '')"
+  else
+    nobjnm_expr="NULL AS NOBJNM"
+    nobjnm_filter=""
+  fi
+  if [ "$has_lnam" = "1" ]; then
+    lnam_expr="LNAM"
+  else
+    lnam_expr="NULL AS LNAM"
+  fi
+
+  if [ -n "$objnam_filter" ] && [ -n "$nobjnm_filter" ]; then
+    filter="${objnam_filter} OR ${nobjnm_filter}"
+  else
+    filter="${objnam_filter}${nobjnm_filter}"
+  fi
+
+  piece="SELECT '${table}' AS CLASS, ${objnam_expr}, ${nobjnm_expr}, ${lnam_expr}, geom FROM \"${table}\" WHERE ${filter}"
+  if [ -z "$sql" ]; then
+    sql="$piece"
+  else
+    sql="$sql UNION ALL $piece"
+  fi
+  class_count=$((class_count + 1))
+done
+
+# One export. A cell with no named class at all still runs the records pass, so
+# that names.json has exactly one writer and its absence always means a
+# failure rather than "there was nothing to say".
+geojson="$tmpdir/named.geojson"
+if [ "$class_count" -eq 0 ]; then
+  printf '%s' '{"type":"FeatureCollection","features":[]}' >"$geojson"
+else
+  # -nlt GEOMETRY because the union spans the lot: SEAARE is an area, DEPCNT a
+  # line, LIGHTS a point, and several classes are charted as more than one of
+  # those in the same cell. Without it the target layer takes its type from
+  # whichever arm happens to be first and the rest are written against a
+  # declaration that does not describe them.
+  export_errors="$tmpdir/export.err"
+  if ! ogr2ogr -f GeoJSON "$geojson" "$gpkg" -dialect sqlite -sql "$sql" \
+    -nlt GEOMETRY 2>"$export_errors"; then
+    echo "$input: exporting the named features failed" >&2
+    cat "$export_errors" >&2
+    exit 1
+  fi
+fi
+
+summary="$tmpdir/summary.json"
+if ! node "$SCRIPT_DIR/names-records.mjs" "$geojson" "$outdir/names.json" \
+  --cell "$cell" --cscale "$cscale" --intu "$intu" 2>"$summary"; then
+  echo "$input: writing $outdir/names.json failed" >&2
+  cat "$summary" >&2
+  exit 1
+fi
+cat "$summary" >&2
+
+# The counts the log line reports come from the records pass itself, not from a
+# second count here: the classes that reach a record are the ones worth
+# reporting, and a table whose named rows all fell to the drop rules is not a
+# class this cell contributed.
+summary_count() {
+  grep -oE "\"$1\"[[:space:]]*:[[:space:]]*[0-9]+" "$summary" | head -1 |
+    grep -oE '[0-9]+$' || true
+}
+records=$(summary_count records)
+classes=$(summary_count classes)
+[ -z "$records" ] && records=0
+[ -z "$classes" ] && classes=0
+
+echo "names: $cell $records record(s) from $classes class(es) in $((SECONDS - started))s." >&2
