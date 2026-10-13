@@ -1454,6 +1454,28 @@ describe("the BUAARE edge generator", () => {
   });
 });
 
+describe("the ICEARE label class", () => {
+  test("named ice areas are handed to the label generator", () => {
+    const { node } = run({
+      ...THREE_RUNG_CELL,
+      STUB_TABLES: "DEPARE M_COVR ICEARE",
+    });
+
+    expect(node).toMatch(
+      /generate-labels \S+_LABELS\.geojson .*--class ICEARE:\S+ICEARE\.geojson/,
+    );
+  });
+
+  test("a cell with no ICEARE hands it no ICEARE class", () => {
+    const { node } = run({
+      ...THREE_RUNG_CELL,
+      STUB_TABLES: "DEPARE M_COVR LNDARE",
+    });
+
+    expect(node).not.toContain("--class ICEARE");
+  });
+});
+
 describe("the area edge generator", () => {
   // RESARE and CTNARE participate; DEPARE and M_COVR are handled elsewhere
   // (their own derived layers) and must never be handed to it.

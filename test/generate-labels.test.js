@@ -88,6 +88,18 @@ describe("one anchor per name per chart", () => {
     expect(features.map((f) => f.properties.INTU)).toEqual([4, 5]);
   });
 
+  test("the parts of a named glacier share one ICEARE anchor", () => {
+    const features = run({
+      ICEARE: [
+        island({ OBJNAM: "Mendenhall Glacier", INTU: 5 }, 0, 0),
+        island({ OBJNAM: "Mendenhall Glacier", INTU: 5 }, 0.2, 0, 0.2),
+      ],
+    });
+    expect(features).toHaveLength(1);
+    expect(features[0].properties.OBJNAM).toBe("Mendenhall Glacier");
+    expect(features[0].properties.CLASS).toBe("ICEARE");
+  });
+
   test("an unnamed area gets no label", () => {
     expect(run({ LNDARE: [island({ INTU: 5 })] })).toHaveLength(0);
   });

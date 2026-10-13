@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
-// Derives the _LABELS layer: one label anchor per named land or sea area.
+// Derives the _LABELS layer: one label anchor per named land, sea, built-up or
+// ice area.
 //
 // Usage:
 //   bin/generate-labels <output.geojson> --class LNDARE:LNDARE.geojson \
-//     [--class LNDRGN:LNDRGN.geojson] [--class SEAARE:SEAARE.geojson]
+//     [--class LNDRGN:LNDRGN.geojson] [--class SEAARE:SEAARE.geojson] \
+//     [--class BUAARE:BUAARE.geojson] [--class ICEARE:ICEARE.geojson]
 //
 // Why this layer exists:
 //
