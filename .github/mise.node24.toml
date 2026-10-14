@@ -1,0 +1,3 @@
+# Lockfile checks use Node 24.
+[tools]
+node = "24"
