@@ -1,0 +1,49 @@
+name: Ubuntu 26.04 real GDAL tile build
+
+on:
+  pull_request:
+    paths: [".github/workflows/ubuntu-gdal-bake.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu26-gdal-bake-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TIPPECANOE_VERSION: 2.79.0
+
+jobs:
+  validate:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gdal-bin
+          gdalinfo --version
+      - name: Install tile-join (tippecanoe)
+        run: |
+          docker pull "ghcr.io/openwatersio/tippecanoe:${TIPPECANOE_VERSION}"
+          sudo tee /usr/local/bin/tile-join >/dev/null <<EOF
+          #!/usr/bin/env bash
+          exec docker run --rm -v "\$PWD:/data" --ulimit nofile=100000:100000 \
+            "ghcr.io/openwatersio/tippecanoe:${TIPPECANOE_VERSION}" tile-join "\$@"
+          EOF
+          sudo chmod +x /usr/local/bin/tile-join
+      - name: Download data
+        run: make data
+      - name: Record upstream input hash
+        run: sha256sum data/ALL_ENCs.zip
+      - name: Build tiles
+        run: make -j$(nproc)
+      - name: Verify output opens with GDAL
+        run: |
+          test -s tiles/noaa.pmtiles
+          stat -c '%n %s bytes' tiles/noaa.pmtiles
+          ogrinfo -ro tiles/noaa.pmtiles
