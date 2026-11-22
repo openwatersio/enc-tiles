@@ -26,4 +26,4 @@ Open [http://localhost:5173](http://localhost:5173) in your browser to view the 
 
 ## License
 
-This project is licensed under the [Apache License 2.0](./LICENSE).
+This project is © Open Water Software, LLC and contributors, and licensed under the [Apache License 2.0](./LICENSE).
